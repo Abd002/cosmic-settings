@@ -17,6 +17,8 @@ use crate::pages::input;
 use crate::pages::networking;
 #[cfg(feature = "page-power")]
 use crate::pages::power;
+#[cfg(feature = "page-printers")]
+use crate::pages::printers;
 #[cfg(feature = "page-sound")]
 use crate::pages::sound;
 use crate::pages::{self, system, time};
@@ -57,6 +59,7 @@ use std::{borrow::Cow, str::FromStr};
 
 #[allow(clippy::struct_excessive_bools)]
 #[allow(clippy::module_name_repetitions)]
+
 pub struct SettingsApp {
     last_active_page: Box<str>,
     active_page: page::Entity,
@@ -233,6 +236,8 @@ impl cosmic::Application for SettingsApp {
         app.insert_page::<applications::Page>();
         app.insert_page::<time::Page>();
         app.insert_page::<system::Page>();
+        #[cfg(feature = "page-printers")]
+        app.insert_page::<printers::Page>();
 
         let active_id = match flags.sub_command {
             Some(p) => app.subtask_to_page(&p),
@@ -690,6 +695,13 @@ impl cosmic::Application for SettingsApp {
                 #[cfg(feature = "page-workspaces")]
                 crate::pages::Message::Workspaces(message) => {
                     if let Some(page) = self.pages.page_mut::<desktop::workspaces::Page>() {
+                        return page.update(message).map(Into::into);
+                    }
+                }
+
+                #[cfg(feature = "page-printers")]
+                crate::pages::Message::Printers(message) => {
+                    if let Some(page) = self.pages.page_mut::<printers::Page>() {
                         return page.update(message).map(Into::into);
                     }
                 }

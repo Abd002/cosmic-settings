@@ -1035,3 +1035,5 @@ full-name = Full name
 invalid-username = Invalid username
 password-mismatch = Password and confirmation must match
 save = Save
+printers = Printers
+printers-description = Set up printers, defaults, and print queues

@@ -17,6 +17,8 @@ pub mod input;
 pub mod networking;
 #[cfg(feature = "page-power")]
 pub mod power;
+#[cfg(feature = "page-printers")]
+pub mod printers;
 #[cfg(feature = "page-sound")]
 pub mod sound;
 pub mod system;
@@ -105,6 +107,8 @@ pub enum Message {
     Wired(networking::wired::Message),
     #[cfg(feature = "page-workspaces")]
     Workspaces(desktop::workspaces::Message),
+    #[cfg(feature = "page-printers")]
+    Printers(printers::Message),
 
     // Common page functionality
     CloseContextDrawer,
