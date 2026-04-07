@@ -1,5 +1,6 @@
 use cosmic::app::Task;
 use cosmic_settings_page as page;
+use cosmic_settings_printers as printerBackend;
 
 #[derive(Default)]
 pub struct Page {
