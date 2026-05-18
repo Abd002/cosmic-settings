@@ -84,6 +84,10 @@ pub enum Message {
     PanelApplet(desktop::panel::applets_inner::Message),
     #[cfg(feature = "page-power")]
     Power(power::Message),
+    #[cfg(feature = "page-printers")]
+    PrinterDetails(printers::details::Message),
+    #[cfg(feature = "page-printers")]
+    PrinterQueue(printers::queue::Message),
     #[cfg(feature = "page-region")]
     Region(time::region::Message),
     #[cfg(feature = "page-sound")]

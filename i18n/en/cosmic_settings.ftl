@@ -1037,3 +1037,7 @@ password-mismatch = Password and confirmation must match
 save = Save
 printers = Printers
 printers-description = Set up printers, defaults, and print queues
+printer-details = Printer Details
+printer-details-description = View and manage printer settings
+printer-queue = Printer Queue
+printer-queue-description = View active and completed print jobs

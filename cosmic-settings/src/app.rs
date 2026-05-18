@@ -124,6 +124,8 @@ impl SettingsApp {
             }
             #[cfg(feature = "page-power")]
             PageCommands::Power => self.pages.page_id::<power::Page>(),
+            #[cfg(feature = "page-printers")]
+            PageCommands::Printers => self.pages.page_id::<printers::Page>(),
             #[cfg(feature = "page-region")]
             PageCommands::RegionLanguage => self.pages.page_id::<time::region::Page>(),
             #[cfg(feature = "page-sound")]
@@ -695,6 +697,20 @@ impl cosmic::Application for SettingsApp {
                 #[cfg(feature = "page-workspaces")]
                 crate::pages::Message::Workspaces(message) => {
                     if let Some(page) = self.pages.page_mut::<desktop::workspaces::Page>() {
+                        return page.update(message).map(Into::into);
+                    }
+                }
+
+                #[cfg(feature = "page-printers")]
+                crate::pages::Message::PrinterDetails(message) => {
+                    if let Some(page) = self.pages.page_mut::<printers::details::Page>() {
+                        return page.update(message).map(Into::into);
+                    }
+                }
+
+                #[cfg(feature = "page-printers")]
+                crate::pages::Message::PrinterQueue(message) => {
+                    if let Some(page) = self.pages.page_mut::<printers::queue::Page>() {
                         return page.update(message).map(Into::into);
                     }
                 }
