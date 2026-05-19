@@ -1,8 +1,15 @@
 use cosmic::app::Task;
 use cosmic_settings_page as page;
 
+use super::PrinterEntry;
+
 #[derive(Clone, Debug)]
-pub enum Message {}
+pub enum Message {
+    LoadPrinter {
+        printer: PrinterEntry,
+        is_default: bool,
+    },
+}
 
 impl From<Message> for crate::pages::Message {
     fn from(message: Message) -> Self {
@@ -19,6 +26,8 @@ impl From<Message> for crate::app::Message {
 #[derive(Default)]
 pub struct Page {
     entity: page::Entity,
+    printer: Option<PrinterEntry>,
+    is_default: bool,
 }
 
 impl page::AutoBind<crate::pages::Message> for Page {
@@ -41,6 +50,16 @@ impl page::Page<crate::pages::Message> for Page {
 
 impl Page {
     pub fn update(&mut self, message: Message) -> Task<crate::Message> {
-        match message {}
+        match message {
+            Message::LoadPrinter {
+                printer,
+                is_default,
+            } => {
+                self.printer = Some(printer);
+                self.is_default = is_default;
+            }
+        }
+
+        Task::none()
     }
 }
