@@ -1064,3 +1064,4 @@ remove-printer = Remove printer
 open-printer-queue = Open print queue
 printer-information = Printer information
 no-printer-selected = No printer selected
+no-print-jobs = No print jobs
