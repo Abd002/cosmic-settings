@@ -5,6 +5,8 @@ use cosmic::widget::{
     button, column, dropdown, row, settings, space::horizontal as horizontal_space, text,
 };
 use cosmic_settings_page as page;
+use cosmic_settings_printers_client::{self as printers_client, CosmicPrintersProxy};
+pub use cosmic_settings_printers_core::{PrinterEntry, PrinterStatus, SupplyLevel};
 use slotmap::SlotMap;
 
 pub mod add_printer;
@@ -33,50 +35,13 @@ impl Default for Page {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PrinterStatus {
-    Ready,
-    Offline,
-    LowToner,
-}
-
-impl PrinterStatus {
-    fn label(&self) -> String {
-        match self {
-            Self::Ready => fl!("printer-ready"),
-            Self::Offline => fl!("printer-offline"),
-            Self::LowToner => fl!("printer-low-toner"),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct SupplyLevel {
-    pub name: String,
-    pub level_percent: u8,
-}
-
-#[derive(Clone, Debug)]
-pub struct PrinterEntry {
-    pub id: String,
-    pub name: String,
-    pub status: PrinterStatus,
-    pub queue_status: String,
-    pub location: String,
-    pub model: String,
-    pub device_name: String,
-    pub driver_version: String,
-    pub paper_size_idx: usize,
-    pub print_sides_idx: usize,
-    pub supplies: Vec<SupplyLevel>,
-}
-
 #[derive(Clone, Debug)]
 pub enum Message {
     OpenAddPrinterDialog,
     CloseAddPrinterDialog,
     DefaultPrinterDropdown(usize),
     Refresh,
+    PrintersLoaded(Result<Vec<PrinterEntry>, String>),
     SelectPrinter(PrinterEntry),
     Surface(cosmic::surface::Action),
 }
@@ -107,6 +72,12 @@ impl page::Page<crate::pages::Message> for Page {
     fn dialog(&self) -> Option<Element<'_, crate::pages::Message>> {
         self.show_add_printer_dialog
             .then(|| add_printer::dialog(Message::CloseAddPrinterDialog))
+    }
+
+    fn on_enter(&mut self) -> cosmic::Task<crate::pages::Message> {
+        cosmic::task::future(async {
+            crate::pages::Message::Printers(Message::PrintersLoaded(load_printers().await))
+        })
     }
 
     fn content(
@@ -162,7 +133,23 @@ impl Page {
                     .and_then(|printer_idx| self.printers.get(printer_idx))
                     .map(|printer| printer.id.clone());
             }
-            Message::Refresh => {}
+            Message::Refresh => {
+                return cosmic::task::future(async {
+                    crate::Message::PageMessage(crate::pages::Message::Printers(
+                        Message::PrintersLoaded(load_printers().await),
+                    ))
+                });
+            }
+            Message::PrintersLoaded(Ok(printers)) => {
+                self.printers = printers;
+                self.default_printer_labels = default_printer_labels(&self.printers);
+            }
+            Message::PrintersLoaded(Err(why)) => {
+                tracing::error!(why, "failed to load printers");
+                self.printers.clear();
+                self.default_printer_id = None;
+                self.default_printer_labels = default_printer_labels(&self.printers);
+            }
             Message::SelectPrinter(printer) => {
                 let is_default = self.default_printer_id.as_deref() == Some(printer.id.as_str());
                 return Task::batch([
@@ -182,6 +169,28 @@ impl Page {
             }
         }
         Task::none()
+    }
+}
+
+async fn load_printers() -> Result<Vec<PrinterEntry>, String> {
+    let mut client = printers_client::connect()
+        .await
+        .map_err(|why| why.to_string())?;
+    let reply = client
+        .conn
+        .list_printers()
+        .await
+        .map_err(|why| why.to_string())?
+        .map_err(|why| format!("{why:?}"))?;
+
+    Ok(reply.printers)
+}
+
+fn printer_status_label(status: &PrinterStatus) -> String {
+    match status {
+        PrinterStatus::Ready => fl!("printer-ready"),
+        PrinterStatus::Offline => fl!("printer-offline"),
+        PrinterStatus::LowToner => fl!("printer-low-toner"),
     }
 }
 
@@ -224,7 +233,7 @@ fn view_list(page: &Page) -> Element<'_, crate::pages::Message> {
         for printer in &page.printers {
             let item = crate::widget::go_next_with_item(
                 &printer.name,
-                text::body(printer.status.label()),
+                text::body(printer_status_label(&printer.status)),
                 Message::SelectPrinter(printer.clone()),
             );
 

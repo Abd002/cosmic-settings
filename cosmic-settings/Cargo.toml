@@ -40,7 +40,8 @@ cosmic-settings-sound-subscription = { path = "../subscriptions/sound", optional
     "auto-profile-init",
 ] }
 cosmic-settings-wallpaper = { path = "../pages/wallpapers" }
-cosmic-settings-printers = { path = "../crates/cosmic-printers", optional = true }
+cosmic-settings-printers-client = { path = "../../cosmic-settings-daemon/printers-client", optional = true }
+cosmic-settings-printers-core = { path = "../../cosmic-settings-daemon/printers-core", optional = true }
 cosmic-settings-daemon-config = { git = "https://github.com/pop-os/cosmic-settings-daemon", optional = true }
 derive_setters = "0.1.9"
 dirs = "6.0.0"
@@ -187,7 +188,8 @@ page-users = ["xdg-portal", "dep:accounts-zbus", "dep:zbus", "dep:zbus_polkit"]
 page-window-management = ["cosmic-comp-config", "dep:cosmic-settings-config"]
 page-workspaces = ["cosmic-comp-config"]
 page-printers = [
-  "dep:cosmic-settings-printers",
+  "dep:cosmic-settings-printers-client",
+  "dep:cosmic-settings-printers-core",
 ]
 
 # Other features
