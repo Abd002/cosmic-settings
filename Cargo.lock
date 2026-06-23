@@ -1768,6 +1768,7 @@ dependencies = [
 [[package]]
 name = "cosmic-settings-printers-client"
 version = "0.1.0"
+source = "git+https://github.com/Abd002/cosmic-printers.git#c4ef3432b2295dbac25a58363f427519dacb4ff7"
 dependencies = [
  "cosmic-settings-printers-core",
  "dirs",
@@ -1778,6 +1779,7 @@ dependencies = [
 [[package]]
 name = "cosmic-settings-printers-core"
 version = "0.1.0"
+source = "git+https://github.com/Abd002/cosmic-printers.git#c4ef3432b2295dbac25a58363f427519dacb4ff7"
 dependencies = [
  "serde",
  "zlink",

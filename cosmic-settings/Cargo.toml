@@ -40,8 +40,8 @@ cosmic-settings-sound-subscription = { path = "../subscriptions/sound", optional
     "auto-profile-init",
 ] }
 cosmic-settings-wallpaper = { path = "../pages/wallpapers" }
-cosmic-settings-printers-client = { path = "../../cosmic-settings-daemon/printers-client", optional = true }
-cosmic-settings-printers-core = { path = "../../cosmic-settings-daemon/printers-core", optional = true }
+cosmic-settings-printers-client = { git = "https://github.com/Abd002/cosmic-printers.git", optional = true }
+cosmic-settings-printers-core = { git = "https://github.com/Abd002/cosmic-printers.git", optional = true }
 cosmic-settings-daemon-config = { git = "https://github.com/pop-os/cosmic-settings-daemon", optional = true }
 derive_setters = "0.1.9"
 dirs = "6.0.0"
