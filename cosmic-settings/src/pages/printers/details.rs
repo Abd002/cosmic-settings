@@ -197,7 +197,7 @@ fn view_details<'a>(
     info_section = info_section.add(settings::item(fl!("model"), text::body(&printer.model)));
     info_section = info_section.add(settings::item(
         fl!("device-name"),
-        text::body(&printer.device_name),
+        text::body(&printer.name),
     ));
     info_section = info_section.add(settings::item(
         fl!("driver-version"),
