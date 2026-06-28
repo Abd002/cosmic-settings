@@ -17,7 +17,7 @@ pub struct Page {
     entity: page::Entity,
     pub(crate) printers: Vec<PrinterEntry>,
     pub(crate) default_printer_id: Option<String>,
-    pub(crate) show_add_printer_dialog: bool,
+    pub(crate) add_printer_dialog: Option<add_printer::Page>,
     details_page: page::Entity,
     default_printer_labels: Vec<String>,
 }
@@ -28,7 +28,7 @@ impl Default for Page {
             entity: page::Entity::default(),
             printers: Vec::new(),
             default_printer_id: None,
-            show_add_printer_dialog: false,
+            add_printer_dialog: None,
             details_page: page::Entity::default(),
             default_printer_labels: default_printer_labels(&[]),
         }
@@ -38,7 +38,7 @@ impl Default for Page {
 #[derive(Clone, Debug)]
 pub enum Message {
     OpenAddPrinterDialog,
-    CloseAddPrinterDialog,
+    AddPrinter(add_printer::Message),
     DefaultPrinterDropdown(usize),
     Refresh,
     PrintersLoaded(Result<Vec<PrinterEntry>, String>),
@@ -70,8 +70,7 @@ impl page::Page<crate::pages::Message> for Page {
     }
 
     fn dialog(&self) -> Option<Element<'_, crate::pages::Message>> {
-        self.show_add_printer_dialog
-            .then(|| add_printer::dialog(Message::CloseAddPrinterDialog))
+        self.add_printer_dialog.as_ref().map(add_printer::dialog)
     }
 
     fn on_enter(&mut self) -> cosmic::Task<crate::pages::Message> {
@@ -122,10 +121,11 @@ impl Page {
     pub fn update(&mut self, message: Message) -> Task<crate::Message> {
         match message {
             Message::OpenAddPrinterDialog => {
-                self.show_add_printer_dialog = true;
+                self.add_printer_dialog = Some(add_printer::Page::new(self.printers.clone()));
+                return add_printer::Page::load_task();
             }
-            Message::CloseAddPrinterDialog => {
-                self.show_add_printer_dialog = false;
+            Message::AddPrinter(message) => {
+                return self.update_add_printer(message);
             }
             Message::DefaultPrinterDropdown(idx) => {
                 self.default_printer_id = idx
@@ -134,15 +134,14 @@ impl Page {
                     .map(|printer| printer.id.clone());
             }
             Message::Refresh => {
-                return cosmic::task::future(async {
-                    crate::Message::PageMessage(crate::pages::Message::Printers(
-                        Message::PrintersLoaded(load_printers().await),
-                    ))
-                });
+                return self.load_printers_task();
             }
             Message::PrintersLoaded(Ok(printers)) => {
                 self.printers = printers;
                 self.default_printer_labels = default_printer_labels(&self.printers);
+                if let Some(dialog) = &mut self.add_printer_dialog {
+                    dialog.configured_printers = self.printers.clone();
+                }
             }
             Message::PrintersLoaded(Err(why)) => {
                 tracing::error!(why, "failed to load printers");
@@ -169,6 +168,35 @@ impl Page {
             }
         }
         Task::none()
+    }
+
+    fn update_add_printer(&mut self, message: add_printer::Message) -> Task<crate::Message> {
+        let Some(dialog) = &mut self.add_printer_dialog else {
+            return Task::none();
+        };
+
+        match dialog.update(message) {
+            add_printer::Action::None => {}
+            add_printer::Action::Close => {
+                self.add_printer_dialog = None;
+            }
+            add_printer::Action::RefreshPrinters => {
+                return self.load_printers_task();
+            }
+            add_printer::Action::Task(task) => {
+                return task;
+            }
+        }
+
+        Task::none()
+    }
+
+    fn load_printers_task(&mut self) -> Task<crate::Message> {
+        cosmic::task::future(async {
+            crate::Message::PageMessage(crate::pages::Message::Printers(Message::PrintersLoaded(
+                load_printers().await,
+            )))
+        })
     }
 }
 
