@@ -304,6 +304,8 @@ impl Page {
                 crate::pages::Message::PrinterDetails(details::Message::LoadPrinter {
                     printer,
                     is_default,
+                    parent_page: self.entity,
+                    queue_page: self.queue_page,
                 }),
             )),
             cosmic::task::message(crate::app::Message::PageMessage(
