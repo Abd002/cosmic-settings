@@ -1,9 +1,9 @@
 use cosmic::Element;
 use cosmic::app::Task;
 use cosmic::iced::{
-    Alignment, Color, Length, Subscription,
+    Alignment, Color, Length, Subscription, event,
     futures::{SinkExt, StreamExt, channel::mpsc::Sender, future},
-    stream,
+    keyboard, stream,
 };
 use cosmic::iced_core::text::{Ellipsize, EllipsizeHeightLimit, Wrapping};
 use cosmic::widget::{self, button, column, container, row, text};
@@ -17,13 +17,10 @@ use slotmap::SlotMap;
 use std::collections::HashMap;
 
 pub mod add_printer;
-#[allow(dead_code)]
 mod backend;
 pub mod details;
 pub mod queue;
-#[allow(dead_code)]
 mod style;
-#[allow(dead_code)]
 mod widgets;
 
 use style::{
@@ -122,7 +119,17 @@ impl page::Page<crate::pages::Message> for Page {
     }
 
     fn subscription(&self, _core: &cosmic::Core) -> Subscription<crate::pages::Message> {
-        Subscription::run(printer_events_subscription).map(crate::pages::Message::Printers)
+        Subscription::batch([
+            Subscription::run(printer_events_subscription).map(crate::pages::Message::Printers),
+            event::listen_with(|event, _, _| match event {
+                cosmic::iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                    Some(crate::pages::Message::PrinterQueue(
+                        queue::Message::ModifiersChanged(modifiers),
+                    ))
+                }
+                _ => None,
+            }),
+        ])
     }
 
     fn content(
@@ -320,7 +327,8 @@ impl Page {
         Task::batch([
             cosmic::task::message(crate::app::Message::PageMessage(
                 crate::pages::Message::PrinterQueue(queue::Message::LoadPrinter {
-                    printer_name: printer.name,
+                    printer: Box::new(printer),
+                    available_printers: self.printers.clone(),
                 }),
             )),
             cosmic::task::message(crate::app::Message::OpenContextDrawer(self.queue_page)),

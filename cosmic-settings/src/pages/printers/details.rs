@@ -1,5 +1,5 @@
 use cosmic::app::Task;
-use cosmic::iced::{Alignment, Color, Length};
+use cosmic::iced::{Alignment, Color, Length, Subscription, event, keyboard};
 use cosmic::iced_core::text::{Ellipsize, EllipsizeHeightLimit, Wrapping};
 use cosmic::widget::{
     self, button, column, container, row, space::horizontal as horizontal_space, text,
@@ -100,6 +100,17 @@ impl page::Page<crate::pages::Message> for Page {
         page::Info::new("printer-details", "printer-symbolic")
             .title(fl!("printer-details"))
             .description(fl!("printer-details-description"))
+    }
+
+    fn subscription(&self, _core: &cosmic::Core) -> Subscription<crate::pages::Message> {
+        event::listen_with(|event, _, _| match event {
+            cosmic::iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                Some(crate::pages::Message::PrinterQueue(
+                    super::queue::Message::ModifiersChanged(modifiers),
+                ))
+            }
+            _ => None,
+        })
     }
 
     fn header(&self) -> Option<Element<'_, crate::pages::Message>> {
@@ -430,7 +441,8 @@ impl Page {
         Task::batch([
             cosmic::task::message(crate::app::Message::PageMessage(
                 crate::pages::Message::PrinterQueue(super::queue::Message::LoadPrinter {
-                    printer_name: printer.name.clone(),
+                    printer: Box::new(printer.clone()),
+                    available_printers: vec![printer.clone()],
                 }),
             )),
             cosmic::task::message(crate::app::Message::OpenContextDrawer(self.queue_page)),

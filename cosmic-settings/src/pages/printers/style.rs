@@ -76,6 +76,12 @@ pub const QUEUE_ERROR: Color = Color::from_rgb(
     0xA0 as f32 / 255.0,
     0x9A as f32 / 255.0,
 );
+pub const QUEUE_SELECTION_BG: Color = Color::from_rgba(
+    0x4D as f32 / 255.0,
+    0x4D as f32 / 255.0,
+    0x4D as f32 / 255.0,
+    0.3,
+);
 
 // Supply and destructive-action colors.
 pub const SUPPLY_TRACK: Color = Color::from_rgb(
