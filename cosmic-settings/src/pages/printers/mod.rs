@@ -8,10 +8,11 @@ use cosmic::iced::{
 use cosmic::iced_core::text::{Ellipsize, EllipsizeHeightLimit, Wrapping};
 use cosmic::widget::{self, button, column, container, row, text};
 use cosmic_settings_page as page;
-use cosmic_settings_printers_client::{self as printers_client, CosmicPrintersProxy};
+use cosmic_settings_printers_client::{self as printers_client};
 use cosmic_settings_printers_core::{GroupedDevice, group_printers};
 pub use cosmic_settings_printers_core::{
-    PrinterApplication, PrinterEntry, PrinterStatus, PrintersEvent, PrintersEventKind, SupplyLevel,
+    JobFilter, PrinterApplication, PrinterEntry, PrinterStatus, PrintersEvent, PrintersEventKind,
+    SupplyLevel,
 };
 use slotmap::SlotMap;
 use std::collections::HashMap;
@@ -150,7 +151,7 @@ impl Page {
             .and_then(|default_id| {
                 self.printers
                     .iter()
-                    .position(|printer| printer.id == default_id)
+                    .position(|printer| printer.id() == default_id)
             })
             .map_or(0, |index| index + 1);
 
@@ -234,7 +235,7 @@ impl Page {
         let printer_id = index
             .checked_sub(1)
             .and_then(|printer_index| self.printers.get(printer_index))
-            .map(|printer| printer.id.clone());
+            .map(|printer| printer.id().to_string());
         self.default_printer_id = printer_id.clone();
 
         if let Some(printer_id) = printer_id {
@@ -250,12 +251,12 @@ impl Page {
         self.default_printer_id = load
             .printers
             .iter()
-            .find(|printer| printer.is_default)
-            .map(|printer| printer.id.clone());
+            .find(|printer| printer.is_default())
+            .map(|printer| printer.id().to_string());
         self.active_job_counts.retain(|printer_id, _| {
             load.printers
                 .iter()
-                .any(|printer| printer.id == *printer_id)
+                .any(|printer| printer.id() == printer_id)
         });
         self.printers = load.printers;
         self.printer_applications = load.printer_applications;
@@ -304,7 +305,7 @@ impl Page {
 
     fn open_printer_settings(&mut self, printer: PrinterEntry) -> Task<crate::Message> {
         self.printer_context = None;
-        let is_default = self.default_printer_id.as_deref() == Some(printer.id.as_str());
+        let is_default = self.default_printer_id.as_deref() == Some(printer.id());
 
         Task::batch([
             cosmic::task::message(crate::app::Message::PageMessage(
@@ -374,7 +375,7 @@ impl Page {
 
     fn load_active_jobs_task(&self) -> Task<crate::Message> {
         Task::batch(self.printers.iter().map(|printer| {
-            let printer_id = printer.id.clone();
+            let printer_id = printer.id().to_string();
 
             cosmic::task::future(async move {
                 let result = load_active_job_count(printer_id.clone()).await;
@@ -397,22 +398,19 @@ async fn load_printers() -> Result<PrintersLoad, String> {
     let mut client = printers_client::connect()
         .await
         .map_err(|why| why.to_string())?;
-    let printers = client
-        .conn
-        .list_printers()
+    client
+        .start_discovery()
         .await
-        .map_err(|why| why.to_string())?
-        .map_err(|why| format!("{why:?}"))?;
+        .map_err(|why| why.to_string())?;
+    let printers = client.printers().await.map_err(|why| why.to_string())?;
     let printer_applications = client
-        .conn
-        .list_printer_applications()
+        .printer_applications()
         .await
-        .map_err(|why| why.to_string())?
-        .map_err(|why| format!("{why:?}"))?;
+        .map_err(|why| why.to_string())?;
 
     Ok(PrintersLoad {
-        printers: printers.printers,
-        printer_applications: printer_applications.printer_applications,
+        printers,
+        printer_applications,
     })
 }
 
@@ -438,18 +436,14 @@ async fn watch_printer_events(mut tx: Sender<Message>) {
         return;
     };
 
-    let Ok(mut events) = client.conn.watch_printers().await else {
+    let Ok(mut events) = client.printer_events().await else {
         return;
     };
 
     while let Some(event) = events.next().await {
         match event {
-            Ok(Ok(event)) => {
+            Ok(event) => {
                 let _ = tx.send(Message::PrintersEvent(event)).await;
-            }
-            Ok(Err(why)) => {
-                tracing::warn!(?why, "printer event stream returned an error");
-                break;
             }
             Err(why) => {
                 tracing::warn!(?why, "printer event stream failed");
@@ -463,19 +457,17 @@ async fn load_active_job_count(printer_id: String) -> Result<usize, String> {
     let mut client = printers_client::connect()
         .await
         .map_err(|why| why.to_string())?;
-    let reply = client
-        .conn
-        .get_jobs(printer_id, "active".to_string())
+    let jobs = client
+        .jobs(&printer_id, JobFilter::Active)
         .await
-        .map_err(|why| why.to_string())?
-        .map_err(|why| format!("{why:?}"))?;
+        .map_err(|why| why.to_string())?;
 
-    Ok(reply.jobs.len())
+    Ok(jobs.len())
 }
 
 fn default_printer_labels(printers: &[PrinterEntry]) -> Vec<String> {
     std::iter::once(fl!("default-printer-not-set"))
-        .chain(printers.iter().map(|printer| printer.name.clone()))
+        .chain(printers.iter().map(|printer| printer.name().to_string()))
         .collect()
 }
 
@@ -661,7 +653,7 @@ fn printer_application_header(application: &PrinterApplication) -> Element<'stat
 
 fn printer_destination(page: &Page, printer: &PrinterEntry) -> Element<'static, Message> {
     let mut name_col = column::with_capacity(2).push(
-        single_line(printer.name.clone(), 20, BODY_TEXT)
+        single_line(printer.name().to_string(), 20, BODY_TEXT)
             .font(FONT_BOLD)
             .height(Length::Fixed(30.0)),
     );
@@ -694,10 +686,11 @@ fn printer_destination(page: &Page, printer: &PrinterEntry) -> Element<'static, 
         .spacing(16)
         .padding([16, 24])
         .width(Length::Fill);
-    let trigger = widget::mouse_area(destination)
-        .on_right_press(Message::TogglePrinterContext(Some(printer.id.clone())));
+    let trigger = widget::mouse_area(destination).on_right_press(Message::TogglePrinterContext(
+        Some(printer.id().to_string()),
+    ));
 
-    if page.printer_context.as_deref() == Some(printer.id.as_str()) {
+    if page.printer_context.as_deref() == Some(printer.id()) {
         widget::popover(trigger)
             .position(widget::popover::Position::Bottom)
             .popup(printer_context_menu(page, printer))
@@ -710,10 +703,10 @@ fn printer_destination(page: &Page, printer: &PrinterEntry) -> Element<'static, 
 
 fn printer_destination_actions(printer: &PrinterEntry) -> Element<'static, Message> {
     let mut left = row::with_capacity(2).spacing(4).align_y(Alignment::Center);
-    if let Some(web_page) = printer.web_page.clone() {
+    if let Some(web_page) = printer.web_page() {
         left = left.push(icon_button(
             "view-web-browser-symbolic",
-            Message::OpenPrinterWebPage(web_page),
+            Message::OpenPrinterWebPage(web_page.to_string()),
         ));
     }
     left = left.push(icon_button(
@@ -755,11 +748,11 @@ fn icon_button(name: &'static str, message: Message) -> Element<'static, Message
 }
 
 fn printer_context_menu(page: &Page, printer: &PrinterEntry) -> Element<'static, Message> {
-    let is_default = page.default_printer_id.as_deref() == Some(printer.id.as_str());
+    let is_default = page.default_printer_id.as_deref() == Some(printer.id());
     let rows = column::with_capacity(7)
         .push(context_menu_row(
             fl!("set-as-default-printer"),
-            (!is_default).then(|| Message::SetDefaultPrinter(printer.id.clone())),
+            (!is_default).then(|| Message::SetDefaultPrinter(printer.id().to_string())),
         ))
         .push(widgets::inset_divider(8))
         .push(context_menu_row(
@@ -774,7 +767,9 @@ fn printer_context_menu(page: &Page, printer: &PrinterEntry) -> Element<'static,
         .push(widgets::inset_divider(8))
         .push(context_menu_row(
             fl!("printer-web-interface"),
-            printer.web_page.clone().map(Message::OpenPrinterWebPage),
+            printer
+                .web_page()
+                .map(|web_page| Message::OpenPrinterWebPage(web_page.to_string())),
         ));
 
     container(rows)
@@ -802,14 +797,16 @@ fn selected_default_printer_label(page: &Page) -> String {
 }
 
 fn printer_subtitle(printer: &PrinterEntry) -> Option<String> {
-    non_empty(&printer.model)
-        .filter(|model| *model != printer.name.as_str())
+    printer
+        .model()
+        .and_then(non_empty)
+        .filter(|model| *model != printer.name())
         .map(str::to_owned)
 }
 
 fn active_job_count(page: &Page, printer: &PrinterEntry) -> usize {
     page.active_job_counts
-        .get(&printer.id)
+        .get(printer.id())
         .copied()
         .unwrap_or_default()
 }
@@ -819,7 +816,7 @@ fn visual_status(page: &Page, printer: &PrinterEntry) -> (String, Color) {
         return (fl!("printer-printing"), STATUS_PRINTING);
     }
 
-    match printer.status {
+    match printer.status() {
         PrinterStatus::Ready => (fl!("printer-ready"), STATUS_READY),
         PrinterStatus::Offline => (fl!("printer-stopped"), STATUS_STOPPED),
         PrinterStatus::LowToner => (fl!("printer-low-toner"), STATUS_STOPPED),
@@ -827,8 +824,8 @@ fn visual_status(page: &Page, printer: &PrinterEntry) -> (String, Color) {
 }
 
 fn job_detail(page: &Page, printer: &PrinterEntry) -> String {
-    if !matches!(printer.status, PrinterStatus::Ready)
-        && let Some(reason) = non_empty(&printer.queue_status)
+    if !matches!(printer.status(), PrinterStatus::Ready)
+        && let Some(reason) = printer.queue_status().and_then(non_empty)
     {
         return reason.to_owned();
     }

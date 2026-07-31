@@ -9,8 +9,8 @@ use cosmic::iced_core::text::{Ellipsize, EllipsizeHeightLimit, Wrapping};
 use cosmic::widget::{self, button, column, container, row, scrollable, text};
 use cosmic::{Apply, Element};
 use cosmic_settings_page::{self as page, Section, section};
-use cosmic_settings_printers_client::{self as printers_client, CosmicPrintersProxy};
-use cosmic_settings_printers_core::{JobInfo, JobState, PrinterEntry};
+use cosmic_settings_printers_client::{self as printers_client};
+use cosmic_settings_printers_core::{JobFilter, JobInfo, JobState, PrinterEntry};
 use slotmap::SlotMap;
 
 use super::style::{
@@ -325,7 +325,11 @@ impl Page {
 
         self.menu = None;
 
-        let Some(printer_id) = self.printer.as_ref().map(|printer| printer.id.clone()) else {
+        let Some(printer_id) = self
+            .printer
+            .as_ref()
+            .map(|printer| printer.id().to_string())
+        else {
             return Task::none();
         };
 
@@ -371,7 +375,7 @@ impl Page {
     }
 
     fn is_current_printer(&self, printer_id: &str) -> bool {
-        self.printer.as_ref().map(|printer| printer.id.as_str()) == Some(printer_id)
+        self.printer.as_ref().map(|printer| printer.id()) == Some(printer_id)
     }
 
     fn select_job(&mut self, job_id: JobId) {
@@ -426,10 +430,14 @@ impl Page {
             return Task::none();
         };
         self.loading = true;
-        let printer_id = printer.id.clone();
-        let include_completed = self.show_completed;
+        let printer_id = printer.id().to_string();
+        let filter = if self.show_completed {
+            JobFilter::All
+        } else {
+            JobFilter::Active
+        };
         cosmic::task::future(async move {
-            let result = load_jobs(printer_id.clone(), include_completed).await;
+            let result = load_jobs(printer_id.clone(), filter).await;
             crate::Message::PageMessage(crate::pages::Message::PrinterQueue(Message::JobsLoaded {
                 printer_id,
                 result,
@@ -657,7 +665,7 @@ fn selected_jobs_menu(page: &Page) -> Element<'static, Message> {
     let web_page = page
         .printer
         .as_ref()
-        .and_then(|printer| printer.web_page.clone());
+        .and_then(|printer| printer.web_page().map(str::to_owned));
 
     menu_surface(
         column::with_capacity(9)
@@ -700,7 +708,7 @@ fn global_queue_menu(page: &Page) -> Element<'static, Message> {
     let web_page = page
         .printer
         .as_ref()
-        .and_then(|printer| printer.web_page.clone());
+        .and_then(|printer| printer.web_page().map(str::to_owned));
 
     menu_surface(
         column::with_capacity(11)
@@ -916,18 +924,14 @@ fn job_ids_for_action(jobs: &[JobInfo], action: JobAction) -> Vec<JobId> {
         .collect()
 }
 
-async fn load_jobs(printer_id: String, include_completed: bool) -> Result<Vec<JobInfo>, String> {
+async fn load_jobs(printer_id: String, filter: JobFilter) -> Result<Vec<JobInfo>, String> {
     let mut client = printers_client::connect()
         .await
         .map_err(|why| why.to_string())?;
-    let filter = if include_completed { "all" } else { "active" };
-    let reply = client
-        .conn
-        .get_jobs(printer_id, filter.to_string())
+    client
+        .jobs(&printer_id, filter)
         .await
-        .map_err(|why| why.to_string())?
-        .map_err(|why| format!("{why:?}"))?;
-    Ok(reply.jobs)
+        .map_err(|why| why.to_string())
 }
 
 async fn run_job_operation(printer_id: String, operation: JobOperation) -> Result<(), String> {
@@ -939,12 +943,11 @@ async fn run_job_operation(printer_id: String, operation: JobOperation) -> Resul
     for job_id in operation.job_ids {
         let job_id = job_id.into_raw();
         let result = match operation.action {
-            JobAction::Pause => client.conn.pause_job(printer_id.clone(), job_id).await,
-            JobAction::Resume => client.conn.resume_job(printer_id.clone(), job_id).await,
-            JobAction::Cancel => client.conn.cancel_job(printer_id.clone(), job_id).await,
+            JobAction::Pause => client.pause_job(&printer_id, job_id).await,
+            JobAction::Resume => client.resume_job(&printer_id, job_id).await,
+            JobAction::Cancel => client.cancel_job(&printer_id, job_id).await,
         }
-        .map_err(|why| why.to_string())?
-        .map_err(|why| format!("{why:?}"));
+        .map_err(|why| why.to_string());
         result?;
     }
     Ok(())

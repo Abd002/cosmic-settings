@@ -259,9 +259,9 @@ impl Page {
         if let Some(printer) = self
             .printer
             .as_mut()
-            .filter(|printer| printer.id == printer_id)
+            .filter(|printer| printer.id() == printer_id)
         {
-            printer.location = location.clone();
+            printer.set_location(location.clone());
         }
 
         cosmic::task::future(async move {
@@ -345,8 +345,8 @@ impl Page {
         let location = self
             .printer
             .as_ref()
-            .filter(|printer| printer.id == printer_id)
-            .map(|printer| printer.location.clone())
+            .filter(|printer| printer.id() == printer_id)
+            .and_then(|printer| printer.location().map(str::to_owned))
             .unwrap_or_default();
 
         self.dialog = Some(Dialog::EditLocation {
@@ -361,14 +361,11 @@ impl Page {
         let value = self
             .printer
             .as_mut()
-            .filter(|printer| printer.id == printer_id)
+            .filter(|printer| printer.id() == printer_id)
             .and_then(|printer| {
-                printer.paper_size_idx = index;
-                let value = printer.paper_sizes.get(index).cloned();
+                let value = printer.paper_sizes().get(index).cloned();
                 if let Some(value) = &value {
-                    printer
-                        .options
-                        .insert("media-default".into(), value.clone());
+                    printer.set_default_paper_size(value.clone());
                 }
                 value
             });
@@ -386,14 +383,11 @@ impl Page {
         let value = self
             .printer
             .as_mut()
-            .filter(|printer| printer.id == printer_id)
+            .filter(|printer| printer.id() == printer_id)
             .and_then(|printer| {
-                printer.print_sides_idx = index;
-                let value = printer.print_sides.get(index).cloned();
+                let value = printer.print_sides().get(index).cloned();
                 if let Some(value) = &value {
-                    printer
-                        .options
-                        .insert("sides-default".into(), value.clone());
+                    printer.set_default_print_sides(value.clone());
                 }
                 value
             });
@@ -433,7 +427,7 @@ impl Page {
         let Some(printer) = self
             .printer
             .as_ref()
-            .filter(|printer| printer.id.as_str() == printer_id)
+            .filter(|printer| printer.id() == printer_id)
         else {
             return Task::none();
         };
@@ -518,7 +512,7 @@ fn details_header(printer: &PrinterEntry) -> Element<'static, Message> {
                     .align_x(Alignment::Start)
                     .push(
                         container(
-                            text::body(printer.name.clone())
+                            text::body(printer.name().to_string())
                                 .size(29)
                                 .font(FONT_SEMIBOLD)
                                 .class(TITLE_TEXT)
@@ -529,7 +523,7 @@ fn details_header(printer: &PrinterEntry) -> Element<'static, Message> {
                         .height(Length::Fixed(43.0))
                         .align_y(Alignment::Center),
                     )
-                    .push(status_line(&printer.status)),
+                    .push(status_line(&printer.status())),
             ),
     )
     .width(Length::Fill)
@@ -592,15 +586,15 @@ fn default_queue_card(printer: &PrinterEntry, is_default: bool) -> Element<'stat
             .push(settings_row(
                 fl!("set-as-default-printer"),
                 widget::toggler(is_default).on_toggle({
-                    let id = printer.id.clone();
+                    let id = printer.id().to_string();
                     move |value| Message::ToggleDefaultPrinter(id.clone(), value)
                 }),
             ))
             .push(widgets::divider())
             .push(action_row(
                 fl!("printer-queue"),
-                printer.queue_status.clone(),
-                Message::OpenPrinterQueue(printer.id.clone()),
+                printer.queue_status().unwrap_or_default().to_string(),
+                Message::OpenPrinterQueue(printer.id().to_string()),
             )),
         97.0,
     )
@@ -611,42 +605,40 @@ fn info_card(printer: &PrinterEntry) -> Element<'static, Message> {
         column::with_capacity(7)
             .push(settings_row(
                 fl!("location"),
-                editable_value(printer.location.clone(), printer.id.clone()),
+                editable_value(
+                    printer.location().unwrap_or_default().to_string(),
+                    printer.id().to_string(),
+                ),
             ))
             .push(widgets::divider())
-            .push(value_row(fl!("model"), printer.model.clone()))
+            .push(value_row(
+                fl!("model"),
+                printer.model().unwrap_or_default().to_string(),
+            ))
             .push(widgets::divider())
-            .push(value_row(fl!("device-name"), printer.name.clone()))
+            .push(value_row(fl!("device-name"), printer.name().to_string()))
             .push(widgets::divider())
             .push(value_row(
                 fl!("driver-version"),
-                printer.driver_version.clone(),
+                printer.driver_version().unwrap_or_default().to_string(),
             )),
         195.0,
     )
 }
 
 fn preferences_card(page: &Page, printer: &PrinterEntry) -> Element<'static, Message> {
-    let paper_size_labels = printer
-        .paper_sizes
+    let paper_sizes = printer.paper_sizes();
+    let print_sides = printer.print_sides();
+    let paper_size_labels = paper_sizes
         .iter()
         .map(|value| media_label(value))
         .collect::<Vec<_>>();
-    let print_sides_labels = printer
-        .print_sides
+    let print_sides_labels = print_sides
         .iter()
         .map(|value| sides_label(value))
         .collect::<Vec<_>>();
-    let paper_size_idx = selected_option_idx(
-        &printer.paper_sizes,
-        printer.options.get("media-default"),
-        printer.paper_size_idx,
-    );
-    let print_sides_idx = selected_option_idx(
-        &printer.print_sides,
-        printer.options.get("sides-default"),
-        printer.print_sides_idx,
-    );
+    let paper_size_idx = selected_option_idx(&paper_sizes, printer.default_paper_size(), 0);
+    let print_sides_idx = selected_option_idx(&print_sides, printer.default_print_sides(), 0);
 
     widgets::card(
         column::with_capacity(3)
@@ -659,7 +651,7 @@ fn preferences_card(page: &Page, printer: &PrinterEntry) -> Element<'static, Mes
                     page.paper_size_dropdown_open,
                     Message::TogglePaperSizeDropdown,
                     {
-                        let id = printer.id.clone();
+                        let id = printer.id().to_string();
                         move |idx| Message::SelectPaperSize(id.clone(), idx)
                     },
                     widgets::DropdownWidths {
@@ -678,7 +670,7 @@ fn preferences_card(page: &Page, printer: &PrinterEntry) -> Element<'static, Mes
                     page.print_sides_dropdown_open,
                     Message::TogglePrintSidesDropdown,
                     {
-                        let id = printer.id.clone();
+                        let id = printer.id().to_string();
                         move |idx| Message::SelectPrintSides(id.clone(), idx)
                     },
                     widgets::DropdownWidths {
@@ -691,7 +683,7 @@ fn preferences_card(page: &Page, printer: &PrinterEntry) -> Element<'static, Mes
     )
 }
 
-fn selected_option_idx(values: &[String], default: Option<&String>, fallback: usize) -> usize {
+fn selected_option_idx(values: &[String], default: Option<&str>, fallback: usize) -> usize {
     default
         .and_then(|default| values.iter().position(|value| value == default))
         .unwrap_or(fallback)
@@ -764,11 +756,12 @@ fn sides_label(value: &str) -> String {
 }
 
 fn supplies_section(printer: &PrinterEntry) -> Element<'static, Message> {
-    let color_supply = find_supply(&printer.supplies, "tri")
-        .or_else(|| find_supply(&printer.supplies, "color"))
-        .or_else(|| printer.supplies.first());
-    let black_supply = find_supply(&printer.supplies, "black")
-        .or_else(|| printer.supplies.get(1))
+    let supplies = printer.supplies();
+    let color_supply = find_supply(&supplies, "tri")
+        .or_else(|| find_supply(&supplies, "color"))
+        .or_else(|| supplies.first());
+    let black_supply = find_supply(&supplies, "black")
+        .or_else(|| supplies.get(1))
         .or(color_supply);
 
     column::with_capacity(2)
@@ -834,7 +827,7 @@ fn remove_printer_action(printer: &PrinterEntry) -> Element<'static, Message> {
                 .height(Length::Fixed(32.0))
                 .padding(0)
                 .class(widgets::pill_button_style(REMOVE_BG, REMOVE_TEXT))
-                .on_press(Message::RemovePrinter(printer.id.clone())),
+                .on_press(Message::RemovePrinter(printer.id().to_string())),
             ),
     )
     .width(Length::Fill)

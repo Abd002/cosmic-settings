@@ -10,7 +10,7 @@ use cosmic::widget::{
     text,
 };
 use cosmic::{Apply, Element};
-use cosmic_settings_printers_client::{self as printers_client, CosmicPrintersProxy};
+use cosmic_settings_printers_client::{self as printers_client};
 use cosmic_settings_printers_core::{PrinterApplication, PrinterEntry};
 
 use super::backend;
@@ -329,14 +329,14 @@ async fn load_discovered_printers() -> Result<Vec<PrinterEntry>, String> {
     let mut client = printers_client::connect()
         .await
         .map_err(|why| why.to_string())?;
-    let reply = client
-        .conn
-        .list_discovered_printers()
+    client
+        .start_discovery()
         .await
-        .map_err(|why| why.to_string())?
-        .map_err(|why| format!("{why:?}"))?;
-
-    Ok(reply.printers)
+        .map_err(|why| why.to_string())?;
+    client
+        .discovered_printers()
+        .await
+        .map_err(|why| why.to_string())
 }
 
 async fn setup_discovered_printer(
@@ -352,21 +352,13 @@ async fn setup_discovered_printer(
     // specific Printer Application. The state machine already preserves it.
     let _ = application_id;
     client
-        .conn
-        .add_discovered_printer(printer_id)
+        .add_discovered_printer(&printer_id)
         .await
-        .map_err(|why| why.to_string())?
-        .map_err(|why| format!("{why:?}"))?;
+        .map_err(|why| why.to_string())?;
 
-    let configured = client
-        .conn
-        .list_printers()
-        .await
-        .map_err(|why| why.to_string())?
-        .map_err(|why| format!("{why:?}"))?;
+    let configured = client.printers().await.map_err(|why| why.to_string())?;
 
     configured
-        .printers
         .into_iter()
         .find(|printer| discovered_queue_matches(printer, &discovered))
         .ok_or_else(|| fl!("configured-printer-not-found"))
@@ -587,7 +579,7 @@ fn discovered_printer_row(page: &Page, printer: &PrinterEntry) -> Element<'stati
 }
 
 fn added_printer_row(printer: &PrinterEntry) -> Element<'static, Message> {
-    let trailing = printer.web_page.clone().map(|web_page| {
+    let trailing = printer.web_page().map(|web_page| {
         button::custom(
             icon::from_name("view-web-browser-symbolic")
                 .size(16)
@@ -598,7 +590,7 @@ fn added_printer_row(printer: &PrinterEntry) -> Element<'static, Message> {
         .width(Length::Fixed(32.0))
         .height(Length::Fixed(32.0))
         .class(cosmic::theme::Button::Transparent)
-        .on_press(Message::OpenPrinterWebPage(web_page))
+        .on_press(Message::OpenPrinterWebPage(web_page.to_string()))
         .into()
     });
 
@@ -818,10 +810,10 @@ fn dialog_footer(label: String) -> Element<'static, Message> {
 
 fn printer_display_name(printer: &PrinterEntry) -> String {
     [
-        printer.name.trim(),
-        printer.model.trim(),
-        printer.device_uri.trim(),
-        printer.id.trim(),
+        printer.name(),
+        printer.model().unwrap_or_default(),
+        printer.device_uri().unwrap_or_default(),
+        printer.id(),
     ]
     .into_iter()
     .find(|value| !value.is_empty())
@@ -843,23 +835,31 @@ fn application_display_name(application: &PrinterApplication) -> String {
 }
 
 fn printer_location_label(printer: &PrinterEntry) -> String {
-    non_empty(&printer.location)
+    printer
+        .location()
+        .and_then(non_empty)
         .map(str::to_string)
         .unwrap_or_else(|| fl!("printer-location-unknown"))
 }
 
 fn printer_matches_search(printer: &PrinterEntry, search: &str) -> bool {
     search.is_empty()
-        || printer.name.to_lowercase().contains(search)
-        || printer.model.to_lowercase().contains(search)
-        || printer.location.to_lowercase().contains(search)
-        || printer.device_uri.to_lowercase().contains(search)
+        || printer.name().to_lowercase().contains(search)
+        || printer
+            .model()
+            .is_some_and(|value| value.to_lowercase().contains(search))
+        || printer
+            .location()
+            .is_some_and(|value| value.to_lowercase().contains(search))
+        || printer
+            .device_uri()
+            .is_some_and(|value| value.to_lowercase().contains(search))
 }
 
 fn application_matches_printer(application: &PrinterApplication, printer: &PrinterEntry) -> bool {
-    let uri_endpoint = uri_endpoint(&printer.device_uri);
+    let uri_endpoint = printer.device_uri().and_then(uri_endpoint);
     let Some(printer_port) = printer
-        .port
+        .port()
         .or_else(|| uri_endpoint.as_ref().map(|(_, port)| *port))
     else {
         return false;
@@ -870,11 +870,10 @@ fn application_matches_printer(application: &PrinterApplication, printer: &Print
 
     let uri_host = uri_endpoint.as_ref().map(|(host, _)| host.as_str());
     let printer_hosts = printer
-        .options
-        .get("dnssd-address")
-        .and_then(|host| non_empty(host))
+        .dnssd_address()
+        .and_then(non_empty)
         .into_iter()
-        .chain(printer.hostname.as_deref().and_then(non_empty))
+        .chain(printer.hostname().and_then(non_empty))
         .chain(uri_host);
 
     printer_hosts.into_iter().any(|printer_host| {
@@ -908,12 +907,15 @@ fn normalize_host(host: &str) -> String {
 }
 
 fn discovered_queue_matches(configured: &PrinterEntry, discovered: &PrinterEntry) -> bool {
-    if !discovered.id.is_empty() && queue_name(&configured.id) == discovered.id {
+    if !discovered.id().is_empty() && queue_name(configured.id()) == discovered.id() {
         return true;
     }
 
     printer_device_uri(configured)
-        .is_some_and(|uri| normalized_uri(uri) == normalized_uri(&discovered.device_uri))
+        .zip(printer_device_uri(discovered))
+        .is_some_and(|(configured_uri, discovered_uri)| {
+            normalized_uri(configured_uri) == normalized_uri(discovered_uri)
+        })
 }
 
 fn queue_name(printer_id: &str) -> &str {
@@ -923,39 +925,17 @@ fn queue_name(printer_id: &str) -> &str {
 }
 
 fn discovered_printer_id(printer: &PrinterEntry) -> String {
-    let service_type = printer
-        .options
-        .get("dnssd-service-type")
-        .map(String::as_str)
-        .unwrap_or_default();
-    let domain = printer
-        .options
-        .get("dnssd-domain")
-        .map(String::as_str)
-        .unwrap_or_default();
+    let service_type = printer.option("dnssd-service-type").unwrap_or_default();
+    let domain = printer.option("dnssd-domain").unwrap_or_default();
     let name = printer
-        .options
-        .get("dnssd-service-name")
-        .map(String::as_str)
-        .unwrap_or(printer.name.as_str());
+        .option("dnssd-service-name")
+        .unwrap_or_else(|| printer.name());
 
     format!("dnssd:{service_type}:{domain}:{name}")
 }
 
 fn printer_device_uri(printer: &PrinterEntry) -> Option<&str> {
-    non_empty(&printer.device_uri)
-        .or_else(|| {
-            printer
-                .options
-                .get("device-uri")
-                .and_then(|uri| non_empty(uri))
-        })
-        .or_else(|| {
-            printer
-                .options
-                .get("printer-uri-supported")
-                .and_then(|uri| non_empty(uri))
-        })
+    printer.device_uri().or_else(|| printer.printer_local_uri())
 }
 
 fn non_empty(value: &str) -> Option<&str> {
