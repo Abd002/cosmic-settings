@@ -29,6 +29,7 @@ pub enum Message {
         is_default: bool,
         parent_page: page::Entity,
         queue_page: page::Entity,
+        available_printers: Vec<PrinterEntry>,
     },
     OpenPrinterQueue(String),
     RemovePrinter(String),
@@ -60,6 +61,7 @@ pub struct Page {
     parent_page: page::Entity,
     queue_page: page::Entity,
     printer: Option<PrinterEntry>,
+    available_printers: Vec<PrinterEntry>,
     dialog: Option<Dialog>,
     is_default: bool,
     paper_size_dropdown_open: bool,
@@ -81,6 +83,7 @@ impl Default for Page {
             parent_page: page::Entity::default(),
             queue_page: page::Entity::default(),
             printer: None,
+            available_printers: Vec::new(),
             dialog: None,
             is_default: false,
             paper_size_dropdown_open: false,
@@ -176,8 +179,15 @@ impl Page {
                 is_default,
                 parent_page,
                 queue_page,
+                available_printers,
             } => {
-                self.load_printer(printer, is_default, parent_page, queue_page);
+                self.load_printer(
+                    printer,
+                    is_default,
+                    parent_page,
+                    queue_page,
+                    available_printers,
+                );
                 Task::none()
             }
             Message::CancelDialog => {
@@ -235,11 +245,13 @@ impl Page {
         is_default: bool,
         parent_page: page::Entity,
         queue_page: page::Entity,
+        available_printers: Vec<PrinterEntry>,
     ) {
         self.printer = Some(printer);
         self.is_default = is_default;
         self.parent_page = parent_page;
         self.queue_page = queue_page;
+        self.available_printers = available_printers;
         self.paper_size_dropdown_open = false;
         self.print_sides_dropdown_open = false;
     }
@@ -436,7 +448,7 @@ impl Page {
             cosmic::task::message(crate::app::Message::PageMessage(
                 crate::pages::Message::PrinterQueue(super::queue::Message::LoadPrinter {
                     printer: Box::new(printer.clone()),
-                    available_printers: vec![printer.clone()],
+                    available_printers: self.available_printers.clone(),
                 }),
             )),
             cosmic::task::message(crate::app::Message::OpenContextDrawer(self.queue_page)),

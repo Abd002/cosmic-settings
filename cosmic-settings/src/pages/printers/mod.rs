@@ -314,6 +314,7 @@ impl Page {
                     is_default,
                     parent_page: self.entity,
                     queue_page: self.queue_page,
+                    available_printers: self.printers.clone(),
                 }),
             )),
             cosmic::task::message(crate::app::Message::PageMessage(
@@ -780,13 +781,7 @@ fn printer_context_menu(page: &Page, printer: &PrinterEntry) -> Element<'static,
 }
 
 fn context_menu_row(label: String, message: Option<Message>) -> Element<'static, Message> {
-    button::custom(single_line(label, 14, BODY_TEXT))
-        .padding([4, 16])
-        .height(Length::Fixed(40.0))
-        .width(Length::Fill)
-        .class(cosmic::theme::Button::Transparent)
-        .on_press_maybe(message)
-        .into()
+    widgets::context_menu_row(single_line(label, 14, BODY_TEXT), message, 40.0)
 }
 
 fn selected_default_printer_label(page: &Page) -> String {

@@ -68,6 +68,20 @@ pub fn context_menu_container() -> cosmic::theme::Container<'static> {
     })
 }
 
+pub fn context_menu_row<'a, Message: Clone + 'a>(
+    content: impl Into<Element<'a, Message>>,
+    message: Option<Message>,
+    height: f32,
+) -> Element<'a, Message> {
+    button::custom(content)
+        .padding([4, 16])
+        .height(Length::Fixed(height))
+        .width(Length::Fill)
+        .class(cosmic::theme::Button::MenuItem)
+        .on_press_maybe(message)
+        .into()
+}
+
 pub fn divider<Message: 'static>() -> Element<'static, Message> {
     container(horizontal_space())
         .width(Length::Fill)

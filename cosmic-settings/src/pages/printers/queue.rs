@@ -25,6 +25,7 @@ const QUEUE_ROW_SPACING: u16 = 16;
 const QUEUE_CONTROLS_WIDTH: f32 = 64.0;
 const QUEUE_SURFACE_HEIGHT: f32 = 600.0;
 const QUEUE_MENU_WIDTH: f32 = 360.0;
+const QUEUE_DESTINATION_MENU_MAX_HEIGHT: f32 = 320.0;
 const QUEUE_MENU_ROW_HEIGHT: u16 = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,10 +89,11 @@ impl JobOperation {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum QueueMenu {
     SelectedJobs,
     Global,
+    MoveToPrinter { job_ids: Vec<JobId> },
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +112,11 @@ pub enum Message {
     ModifiersChanged(Modifiers),
     OpenJobMenu(JobId),
     OpenGlobalMenu,
+    OpenMoveToPrinter(Vec<JobId>),
+    MoveJobs {
+        destination_id: String,
+        job_ids: Vec<JobId>,
+    },
     CloseMenu,
     RunJobAction(JobOperation),
     JobActionFinished {
@@ -223,6 +230,14 @@ impl Page {
                 self.open_global_menu();
                 Task::none()
             }
+            Message::OpenMoveToPrinter(job_ids) => {
+                self.open_move_to_printer(job_ids);
+                Task::none()
+            }
+            Message::MoveJobs {
+                destination_id,
+                job_ids,
+            } => self.start_move_jobs(destination_id, job_ids),
             Message::CloseMenu => {
                 self.menu = None;
                 Task::none()
@@ -318,6 +333,12 @@ impl Page {
         self.menu = Some(QueueMenu::Global);
     }
 
+    fn open_move_to_printer(&mut self, job_ids: Vec<JobId>) {
+        if !job_ids.is_empty() {
+            self.menu = Some(QueueMenu::MoveToPrinter { job_ids });
+        }
+    }
+
     fn start_job_action(&mut self, operation: JobOperation) -> Task<crate::Message> {
         if self.operation_in_flight || !operation.is_available_for(&self.jobs) {
             return Task::none();
@@ -339,6 +360,46 @@ impl Page {
             let result = run_job_operation(printer_id.clone(), operation).await;
             crate::Message::PageMessage(crate::pages::Message::PrinterQueue(
                 Message::JobActionFinished { printer_id, result },
+            ))
+        })
+    }
+
+    fn start_move_jobs(
+        &mut self,
+        destination_id: String,
+        job_ids: Vec<JobId>,
+    ) -> Task<crate::Message> {
+        if self.operation_in_flight || job_ids.is_empty() {
+            return Task::none();
+        }
+
+        let Some(source_printer_id) = self
+            .printer
+            .as_ref()
+            .map(|printer| printer.id().to_string())
+        else {
+            return Task::none();
+        };
+
+        if source_printer_id == destination_id
+            || !self
+                .available_printers
+                .iter()
+                .any(|printer| printer.id() == destination_id)
+        {
+            return Task::none();
+        }
+
+        self.menu = None;
+        self.operation_in_flight = true;
+
+        cosmic::task::future(async move {
+            let result = move_jobs(source_printer_id.clone(), destination_id, job_ids).await;
+            crate::Message::PageMessage(crate::pages::Message::PrinterQueue(
+                Message::JobActionFinished {
+                    printer_id: source_printer_id,
+                    result,
+                },
             ))
         })
     }
@@ -495,9 +556,10 @@ fn queue_view(page: &Page) -> Element<'_, Message> {
     .on_press(Message::ClearSelection)
     .on_right_press(Message::OpenGlobalMenu);
 
-    let popup = match page.menu {
+    let popup = match &page.menu {
         Some(QueueMenu::SelectedJobs) => Some(selected_jobs_menu(page)),
         Some(QueueMenu::Global) => Some(global_queue_menu(page)),
+        Some(QueueMenu::MoveToPrinter { job_ids }) => Some(move_to_printer_menu(page, job_ids)),
         None => None,
     };
 
@@ -692,7 +754,7 @@ fn selected_jobs_menu(page: &Page) -> Element<'static, Message> {
             ))
             .push(menu_row(fl!("refresh"), Some(Message::Refresh)))
             .push(widgets::inset_divider(8))
-            .push(move_to_printer_row(page))
+            .push(move_to_printer_row(page, ids))
             .push(widgets::inset_divider(8))
             .push(menu_row(
                 fl!("printer-web-interface"),
@@ -732,7 +794,14 @@ fn global_queue_menu(page: &Page) -> Element<'static, Message> {
                 Some(Message::ToggleCompleted),
             ))
             .push(widgets::inset_divider(8))
-            .push(move_to_printer_row(page))
+            .push(move_to_printer_row(
+                page,
+                page.jobs
+                    .iter()
+                    .filter(|job| job_can_move(&job.state))
+                    .map(|job| JobId::from_raw(job.id))
+                    .collect(),
+            ))
             .push(widgets::inset_divider(8))
             .push(menu_row(
                 fl!("printer-web-interface"),
@@ -741,8 +810,16 @@ fn global_queue_menu(page: &Page) -> Element<'static, Message> {
     )
 }
 
-fn move_to_printer_row(_page: &Page) -> Element<'static, Message> {
-    button::custom(
+fn move_to_printer_row(page: &Page, job_ids: Vec<JobId>) -> Element<'static, Message> {
+    let enabled = !page.operation_in_flight
+        && !job_ids.is_empty()
+        && page.available_printers.iter().any(|printer| {
+            page.printer
+                .as_ref()
+                .is_none_or(|current| current.id() != printer.id())
+        });
+
+    widgets::context_menu_row(
         row::with_capacity(2)
             .push(
                 text::body(fl!("move-to-printer"))
@@ -753,15 +830,51 @@ fn move_to_printer_row(_page: &Page) -> Element<'static, Message> {
             .push(widgets::symbolic_icon("go-next-symbolic", 16, BODY_TEXT))
             .align_y(Alignment::Center)
             .width(Length::Fill),
+        enabled.then_some(Message::OpenMoveToPrinter(job_ids)),
+        f32::from(QUEUE_MENU_ROW_HEIGHT),
     )
-    .padding([4, 16])
-    .height(Length::Fixed(f32::from(QUEUE_MENU_ROW_HEIGHT)))
-    .width(Length::Fill)
-    .class(cosmic::theme::Button::Transparent)
-    // Do not pretend this action succeeded. Enable it only after the backend
-    // exposes Move-Job and the queue has a real destination-selection flow.
-    .on_press_maybe(None)
-    .into()
+}
+
+fn move_to_printer_menu(page: &Page, job_ids: &[JobId]) -> Element<'static, Message> {
+    let current_printer_id = page.printer.as_ref().map(PrinterEntry::id);
+    let mut destinations = column::with_capacity(page.available_printers.len());
+
+    for printer in &page.available_printers {
+        let destination_id = printer.id().to_string();
+        let message =
+            (current_printer_id != Some(printer.id()) && !page.operation_in_flight).then(|| {
+                Message::MoveJobs {
+                    destination_id,
+                    job_ids: job_ids.to_vec(),
+                }
+            });
+        let label = if printer.name().trim().is_empty() {
+            printer.id().to_string()
+        } else {
+            printer.name().to_string()
+        };
+
+        destinations = destinations.push(widgets::context_menu_row(
+            text::body(label)
+                .size(14)
+                .class(cosmic::theme::Text::Color(BODY_TEXT))
+                .wrapping(Wrapping::None)
+                .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)))
+                .width(Length::Fill),
+            message,
+            f32::from(QUEUE_MENU_ROW_HEIGHT),
+        ));
+    }
+
+    menu_surface(
+        container(
+            scrollable(destinations)
+                .width(Length::Fill)
+                .height(Length::Shrink),
+        )
+        .width(Length::Fill)
+        .max_height(QUEUE_DESTINATION_MENU_MAX_HEIGHT),
+    )
 }
 
 fn menu_toggle_row(
@@ -777,7 +890,7 @@ fn menu_toggle_row(
             .into()
     };
 
-    button::custom(
+    widgets::context_menu_row(
         row::with_capacity(2)
             .push(indicator)
             .push(
@@ -788,28 +901,20 @@ fn menu_toggle_row(
             )
             .align_y(Alignment::Center)
             .width(Length::Fill),
+        message,
+        f32::from(QUEUE_MENU_ROW_HEIGHT),
     )
-    .padding([4, 16])
-    .height(Length::Fixed(f32::from(QUEUE_MENU_ROW_HEIGHT)))
-    .width(Length::Fill)
-    .class(cosmic::theme::Button::Transparent)
-    .on_press_maybe(message)
-    .into()
 }
 
 fn menu_row(label: String, message: Option<Message>) -> Element<'static, Message> {
-    button::custom(
+    widgets::context_menu_row(
         text::body(label)
             .size(14)
             .class(cosmic::theme::Text::Color(BODY_TEXT))
             .width(Length::Fill),
+        message,
+        f32::from(QUEUE_MENU_ROW_HEIGHT),
     )
-    .padding([4, 16])
-    .height(Length::Fixed(f32::from(QUEUE_MENU_ROW_HEIGHT)))
-    .width(Length::Fill)
-    .class(cosmic::theme::Button::Transparent)
-    .on_press_maybe(message)
-    .into()
 }
 
 fn menu_surface(content: impl Into<Element<'static, Message>>) -> Element<'static, Message> {
@@ -951,6 +1056,36 @@ async fn run_job_operation(printer_id: String, operation: JobOperation) -> Resul
         result?;
     }
     Ok(())
+}
+
+async fn move_jobs(
+    source_printer_id: String,
+    destination_printer_id: String,
+    job_ids: Vec<JobId>,
+) -> Result<(), String> {
+    let mut client = printers_client::connect()
+        .await
+        .map_err(|why| why.to_string())?;
+
+    for job_id in job_ids {
+        client
+            .move_job(
+                &source_printer_id,
+                job_id.into_raw(),
+                &destination_printer_id,
+            )
+            .await
+            .map_err(|why| why.to_string())?;
+    }
+
+    Ok(())
+}
+
+fn job_can_move(state: &JobState) -> bool {
+    matches!(
+        state,
+        JobState::Pending | JobState::Held | JobState::Processing | JobState::Stopped
+    )
 }
 
 fn job_state_color(state: &JobState, selected: bool) -> Color {
