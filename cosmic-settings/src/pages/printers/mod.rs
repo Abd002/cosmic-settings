@@ -9,7 +9,7 @@ use cosmic::iced_core::text::{Ellipsize, EllipsizeHeightLimit, Wrapping};
 use cosmic::widget::{self, button, column, container, row, text};
 use cosmic_settings_page as page;
 use cosmic_settings_printers_client::{self as printers_client};
-use cosmic_settings_printers_core::{Error as PrintersError, GroupedDevice, group_printers};
+use cosmic_settings_printers_core::{GroupedDevice, group_printers};
 pub use cosmic_settings_printers_core::{
     JobFilter, PrinterApplication, PrinterEntry, PrinterStatus, PrintersEvent, PrintersEventKind,
     SupplyLevel,
@@ -73,7 +73,7 @@ pub enum Message {
     PrintersLoaded(Result<PrintersLoad, String>),
     JobsLoaded {
         printer_id: String,
-        result: Result<usize, JobCount>,
+        result: Result<usize, String>,
     },
     PrintersEvent(PrintersEvent),
     OpenPrinterSettings(PrinterEntry),
@@ -82,30 +82,6 @@ pub enum Message {
     SetDefaultPrinter(String),
     OpenPrinterWebPage(String),
     PrinterWebPageOpened(Result<(), String>),
-}
-
-/// Why a printer's count of waiting jobs could not be read.
-///
-/// A printer that cannot be reached is ordinary — a discovered printer is only
-/// advertised until it is set up, and has no queue of its own to ask — so it is
-/// worth telling apart from a printer that should have answered and did not.
-#[derive(Clone, Debug)]
-pub enum JobCount {
-    PrinterUnreachable(String),
-    Failed(String),
-}
-
-impl From<printers_client::ClientError> for JobCount {
-    fn from(error: printers_client::ClientError) -> Self {
-        let why = error.to_string();
-
-        match error {
-            printers_client::ClientError::Service(PrintersError::DeviceUnreachable { .. }) => {
-                Self::PrinterUnreachable(why)
-            }
-            _ => Self::Failed(why),
-        }
-    }
 }
 
 impl From<Message> for crate::pages::Message {
@@ -299,17 +275,14 @@ impl Page {
         self.default_printer_labels = default_printer_labels(&self.printers);
     }
 
-    fn apply_active_job_count(&mut self, printer_id: String, result: Result<usize, JobCount>) {
+    fn apply_active_job_count(&mut self, printer_id: String, result: Result<usize, String>) {
         match result {
             Ok(count) => {
                 self.active_job_counts.insert(printer_id, count);
             }
             // The count stays absent rather than being shown as none, which would
             // claim the printer was asked and had nothing waiting.
-            Err(JobCount::PrinterUnreachable(why)) => {
-                tracing::debug!(printer_id, why, "printer could not be asked for its jobs");
-            }
-            Err(JobCount::Failed(why)) => {
+            Err(why) => {
                 tracing::warn!(printer_id, why, "failed to load active printer jobs");
             }
         }
@@ -506,12 +479,14 @@ async fn watch_printer_events(mut tx: Sender<Message>) {
     }
 }
 
-async fn load_active_job_count(printer_id: String) -> Result<usize, JobCount> {
-    let mut client = printers_client::connect().await.map_err(JobCount::from)?;
+async fn load_active_job_count(printer_id: String) -> Result<usize, String> {
+    let mut client = printers_client::connect()
+        .await
+        .map_err(|why| why.to_string())?;
     let jobs = client
         .jobs(&printer_id, JobFilter::Active)
         .await
-        .map_err(JobCount::from)?;
+        .map_err(|why| why.to_string())?;
 
     Ok(jobs.len())
 }
