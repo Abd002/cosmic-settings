@@ -154,6 +154,11 @@ pub struct Page {
     jobs: Vec<JobInfo>,
     loading: bool,
     error: Option<String>,
+    /// What a cancel, pause, resume, move or test page last reported.
+    ///
+    /// Separate from `error`, which describes the list itself: an action's message
+    /// has to outlive the reload that follows it, and reloading clears `error`.
+    action_error: Option<String>,
     selected_jobs: HashSet<JobId>,
     selection_anchor: Option<JobId>,
     show_completed: bool,
@@ -287,6 +292,7 @@ impl Page {
         self.jobs.clear();
         self.clear_selection();
         self.error = None;
+        self.action_error = None;
         self.show_completed = false;
         self.load_jobs_task()
     }
@@ -423,9 +429,12 @@ impl Page {
         }
 
         self.operation_in_flight = false;
-        if let Err(why) = result {
-            tracing::warn!(printer_id, why, "print job operation failed");
-            self.error = Some(why);
+        match result {
+            Ok(()) => self.action_error = None,
+            Err(why) => {
+                tracing::warn!(printer_id, why, "print job operation failed");
+                self.action_error = Some(why);
+            }
         }
 
         Task::batch([
@@ -476,12 +485,12 @@ impl Page {
         match result {
             Ok(job_id) => {
                 tracing::info!(printer_id, job_id, "queued a test page");
+                self.action_error = None;
             }
-            // Nothing was queued, so there is nothing to reload — and reloading is
-            // what would erase this message before it could be read.
+            // Nothing was queued, so there is nothing to reload.
             Err(why) => {
                 tracing::warn!(printer_id, why, "failed to print a test page");
-                self.error = Some(why);
+                self.action_error = Some(why);
                 return Task::none();
             }
         }
@@ -586,11 +595,20 @@ fn queue_view(page: &Page) -> Element<'_, Message> {
     };
 
     let cancelable = job_ids_for_action(&page.jobs, JobAction::Cancel);
-    let mut content = column::with_capacity(2)
-        .push(body)
+    let mut content = column::with_capacity(3)
         .spacing(24)
         .width(Length::Fill)
         .height(Length::Fill);
+
+    if let Some(action_error) = &page.action_error {
+        content = content.push(
+            text::body(action_error.clone())
+                .class(QUEUE_ERROR)
+                .width(Length::Fill),
+        );
+    }
+
+    content = content.push(body);
 
     if !cancelable.is_empty() {
         let cancel_all =
