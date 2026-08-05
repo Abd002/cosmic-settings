@@ -223,10 +223,7 @@ impl Page {
     }
 
     fn open_add_printer_dialog(&mut self) -> Task<crate::Message> {
-        self.add_printer_dialog = Some(add_printer::Page::new(
-            self.printers.clone(),
-            self.printer_applications.clone(),
-        ));
+        self.add_printer_dialog = Some(add_printer::Page::new(self.printers.clone()));
         add_printer::Page::load_task()
     }
 
@@ -264,7 +261,6 @@ impl Page {
 
         if let Some(dialog) = &mut self.add_printer_dialog {
             dialog.configured_printers = self.printers.clone();
-            dialog.printer_applications = self.printer_applications.clone();
         }
 
         self.load_active_jobs_task()
@@ -292,14 +288,32 @@ impl Page {
 
     fn handle_printers_event(&self, event: PrintersEvent) -> Task<crate::Message> {
         match event.kind {
-            PrintersEventKind::DiscoveredPrintersChanged => {
-                let mut tasks = vec![Self::load_printers_task()];
-                if self.add_printer_dialog.is_some() {
-                    tasks.push(add_printer::Page::load_task());
-                }
-                Task::batch(tasks)
+            // The dialog shows configured printers too, and a destination appearing
+            // or going away changes what it should say.
+            PrintersEventKind::AvailableDestinationsChanged
+            | PrintersEventKind::PrinterApplicationsChanged => Task::batch([
+                Self::load_printers_task(),
+                self.add_printer_task(add_printer::Page::refresh_task),
+            ]),
+            PrintersEventKind::AddPrinterDiscoveryChanged => {
+                self.add_printer_task(add_printer::Page::refresh_task)
             }
-            PrintersEventKind::PrinterApplicationsChanged => Self::load_printers_task(),
+            PrintersEventKind::PrinterConfigurationChanged => self.add_printer_task(|| {
+                cosmic::task::message(crate::Message::PageMessage(
+                    add_printer::Message::ConfigurationChanged.into(),
+                ))
+            }),
+        }
+    }
+
+    fn add_printer_task(
+        &self,
+        task: impl FnOnce() -> Task<crate::Message>,
+    ) -> Task<crate::Message> {
+        if self.add_printer_dialog.is_some() {
+            task()
+        } else {
+            Task::none()
         }
     }
 
@@ -358,6 +372,11 @@ impl Page {
             add_printer::Action::RefreshPrinters => {
                 return Self::load_printers_task();
             }
+            // A printer that has just been set up is no longer something to add, and
+            // whether it is set up is something only a fresh round establishes.
+            add_printer::Action::RediscoverPrinters => {
+                return Task::batch([Self::load_printers_task(), add_printer::Page::load_task()]);
+            }
             add_printer::Action::Task(task) => {
                 return task;
             }
@@ -400,7 +419,11 @@ async fn load_printers() -> Result<PrintersLoad, String> {
         .await
         .map_err(|why| why.to_string())?;
     client
-        .start_discovery()
+        .refresh_available_destinations()
+        .await
+        .map_err(|why| why.to_string())?;
+    client
+        .start_printer_application_discovery()
         .await
         .map_err(|why| why.to_string())?;
     let printers = client.printers().await.map_err(|why| why.to_string())?;

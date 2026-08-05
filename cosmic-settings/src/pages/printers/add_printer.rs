@@ -11,7 +11,12 @@ use cosmic::widget::{
 };
 use cosmic::{Apply, Element};
 use cosmic_settings_printers_client::{self as printers_client};
-use cosmic_settings_printers_core::{PrinterApplication, PrinterEntry};
+use cosmic_settings_printers_core::{
+    AddPrinterDiscoveryReply, AddPrinterDiscoveryState, ConfigureDiscoveredPrinterRequest,
+    ConfigurePrinterReply, DiscoveredPhysicalPrinter, DiscoveryGeneration, Error as PrinterError,
+    ManualSetupPrinterApplication, PaCandidateState, PrinterApplicationCandidateSummary,
+    PrinterConfigurationState, PrinterEntry,
+};
 
 use super::backend;
 use super::style::{
@@ -30,61 +35,58 @@ const APPLICATION_ROW_HEIGHT: f32 = 48.0;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DialogView {
     Discovery,
-    SelectApplication {
-        printer_id: String,
-        application_ids: Vec<String>,
-    },
+    SelectApplication { printer_id: String },
     ManualSetup,
-    Adding {
-        printer_id: String,
-        application_id: Option<String>,
-    },
+    Adding { printer_id: String },
     Added,
 }
 
 #[derive(Clone, Debug)]
 pub struct Page {
     pub search: String,
-    pub loading: bool,
     pub error: Option<String>,
     pub configured_printers: Vec<PrinterEntry>,
-    pub discovered_printers: Vec<PrinterEntry>,
-    pub printer_applications: Vec<PrinterApplication>,
     pub view: DialogView,
-    pub added_printers: Vec<PrinterEntry>,
+    discovery: Option<AddPrinterDiscoveryReply>,
+    manual_setup_applications: Vec<ManualSetupPrinterApplication>,
+    pending_operation: Option<String>,
+    added: Vec<AddedPrinter>,
+}
+
+#[derive(Clone, Debug)]
+struct AddedPrinter {
+    name: String,
+    destination_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Load {
+    discovery: AddPrinterDiscoveryReply,
+    manual_setup_applications: Vec<ManualSetupPrinterApplication>,
 }
 
 impl Page {
-    pub fn new(
-        configured_printers: Vec<PrinterEntry>,
-        printer_applications: Vec<PrinterApplication>,
-    ) -> Self {
+    pub fn new(configured_printers: Vec<PrinterEntry>) -> Self {
         Self {
             search: String::new(),
-            loading: true,
             error: None,
             configured_printers,
-            discovered_printers: Vec::new(),
-            printer_applications,
             view: DialogView::Discovery,
-            added_printers: Vec::new(),
+            discovery: None,
+            manual_setup_applications: Vec::new(),
+            pending_operation: None,
+            added: Vec::new(),
         }
     }
 
-    pub fn visible_printers(&self) -> impl Iterator<Item = &PrinterEntry> {
-        let search = self.search.trim().to_lowercase();
-
-        self.discovered_printers.iter().filter(move |printer| {
-            !self.printer_is_configured(printer) && printer_matches_search(printer, &search)
-        })
+    /// Starts a fresh round of discovery and loads its first results.
+    pub fn load_task() -> Task<crate::Message> {
+        loaded_task(start_discovery())
     }
 
-    pub fn load_task() -> Task<crate::Message> {
-        cosmic::task::future(async {
-            crate::Message::PageMessage(crate::pages::Message::Printers(
-                Message::DiscoveredPrintersLoaded(load_discovered_printers().await).into(),
-            ))
-        })
+    /// Reloads the results of the round already in progress.
+    pub fn refresh_task() -> Task<crate::Message> {
+        loaded_task(load())
     }
 
     pub fn update(&mut self, message: Message) -> Action {
@@ -94,10 +96,11 @@ impl Page {
                 self.search = search;
                 Action::None
             }
-            Message::DiscoveredPrintersLoaded(result) => {
-                self.apply_discovered_printers(result);
+            Message::Loaded(result) => {
+                self.apply_load(result);
                 Action::None
             }
+            Message::ConfigurationChanged => self.poll_configuration(),
             Message::OpenManualSetup => {
                 self.open_manual_setup();
                 Action::None
@@ -105,11 +108,8 @@ impl Page {
             Message::SelectDiscoveredPrinter(printer_id) => {
                 self.select_discovered_printer(printer_id)
             }
-            Message::SelectPrinterApplication(application_id) => {
-                self.select_printer_application(application_id)
-            }
-            Message::OpenPrinterApplication(application_id) => {
-                self.open_printer_application(application_id)
+            Message::SelectPrinterApplication(candidate_id) => {
+                self.select_printer_application(candidate_id)
             }
             Message::OpenPrinterWebPage(web_page) => Self::open_web_page(web_page),
             Message::PrinterSetupFinished(result) => self.finish_printer_setup(result),
@@ -117,21 +117,26 @@ impl Page {
         }
     }
 
-    fn apply_discovered_printers(&mut self, result: Result<Vec<PrinterEntry>, String>) {
+    fn apply_load(&mut self, result: Result<Load, String>) {
         match result {
-            Ok(printers) => {
-                self.loading = false;
+            Ok(load) => {
                 self.error = None;
-                self.discovered_printers = printers;
-                if self.view == DialogView::Discovery && self.visible_printers().next().is_none() {
+                self.discovery = Some(load.discovery);
+                self.manual_setup_applications = load.manual_setup_applications;
+                // Nothing was found, so there is nothing to choose from and the
+                // wizard opens where the user can still get somewhere. This asks
+                // what discovery found, not what the search box is showing: a
+                // search term that matches nothing is not an empty result.
+                if self.view == DialogView::Discovery
+                    && !self.is_searching()
+                    && self.printers_to_set_up().next().is_none()
+                {
                     self.view = DialogView::ManualSetup;
                 }
             }
             Err(why) => {
-                tracing::error!(why, "failed to discover printers");
-                self.loading = false;
+                tracing::error!(why, "failed to load add printer discovery");
                 self.error = Some(fl!("failed-to-load-printers"));
-                self.discovered_printers.clear();
             }
         }
     }
@@ -146,67 +151,102 @@ impl Page {
     }
 
     fn select_discovered_printer(&mut self, printer_id: String) -> Action {
-        if self.loading || self.is_adding() {
+        if self.is_searching() || self.is_adding() {
             return Action::None;
         }
 
-        let Some(printer) = self.discovered_printer(&printer_id) else {
-            self.error = Some(fl!("no-compatible-printer-applications"));
+        let Some(printer) = self.physical_printer(&printer_id) else {
+            self.error = Some(fl!("no-printers-found"));
             return Action::None;
         };
-        let application_ids = self.application_ids_for_printer(printer);
 
-        match application_ids.as_slice() {
+        match selectable_candidate_ids(printer).as_slice() {
+            // Nothing can drive it, so the way forward is a Printer Application's
+            // own setup rather than an error the user cannot act on.
             [] => {
-                self.error = Some(fl!("no-compatible-printer-applications"));
+                self.open_manual_setup();
                 Action::None
             }
-            [application_id] => self.start_setup(printer_id, Some(application_id.clone())),
+            [candidate_id] => {
+                let candidate_id = candidate_id.clone();
+                self.start_setup(printer_id, candidate_id)
+            }
             _ => {
                 self.error = None;
-                self.view = DialogView::SelectApplication {
-                    printer_id,
-                    application_ids,
-                };
+                self.view = DialogView::SelectApplication { printer_id };
                 Action::None
             }
         }
     }
 
-    fn select_printer_application(&mut self, application_id: String) -> Action {
-        let printer_id = match &self.view {
-            DialogView::SelectApplication {
-                printer_id,
-                application_ids,
-            } if application_ids.contains(&application_id) => printer_id.clone(),
-            _ => return Action::None,
+    fn select_printer_application(&mut self, candidate_id: String) -> Action {
+        let DialogView::SelectApplication { printer_id } = &self.view else {
+            return Action::None;
         };
+        let printer_id = printer_id.clone();
 
-        self.start_setup(printer_id, Some(application_id))
+        let offered = self
+            .physical_printer(&printer_id)
+            .is_some_and(|printer| selectable_candidate_ids(printer).contains(&candidate_id));
+
+        if offered {
+            self.start_setup(printer_id, candidate_id)
+        } else {
+            Action::None
+        }
     }
 
-    fn open_printer_application(&mut self, application_id: String) -> Action {
-        let Some(web_page) = self
-            .printer_application(&application_id)
-            .and_then(super::printer_application_web_page)
-        else {
-            self.error = Some(fl!("printer-application-web-interface-unavailable"));
+    fn start_setup(&mut self, printer_id: String, candidate_id: String) -> Action {
+        if self.is_adding() {
+            return Action::None;
+        }
+
+        // Rows left over from an earlier round describe devices that may be gone,
+        // so a fresh round is started instead of acting on them.
+        let Some(discovery_generation) = self.selectable_generation() else {
+            self.view = DialogView::Discovery;
+            return Action::Task(Self::load_task());
+        };
+
+        self.error = None;
+        self.view = DialogView::Adding {
+            printer_id: printer_id.clone(),
+        };
+
+        Action::Task(setup_task(ConfigureDiscoveredPrinterRequest {
+            discovery_generation,
+            physical_printer_id: printer_id,
+            candidate_id,
+            requested_display_name: None,
+        }))
+    }
+
+    fn poll_configuration(&self) -> Action {
+        let Some(operation_id) = self.pending_operation.clone() else {
             return Action::None;
         };
 
-        Self::open_web_page(web_page)
+        Action::Task(cosmic::task::future(async move {
+            crate::Message::PageMessage(crate::pages::Message::Printers(
+                Message::PrinterSetupFinished(printer_configuration(operation_id).await).into(),
+            ))
+        }))
     }
 
-    fn finish_printer_setup(&mut self, result: Result<PrinterEntry, String>) -> Action {
+    fn finish_printer_setup(
+        &mut self,
+        result: Result<ConfigurePrinterReply, SetupError>,
+    ) -> Action {
+        self.pending_operation = None;
+
         match result {
-            Ok(printer) => {
+            Ok(reply) => self.apply_configuration(reply),
+            Err(SetupError::ManualSetup { web_interface_uri }) => {
                 self.error = None;
-                self.added_printers.push(printer);
-                self.view = DialogView::Added;
-                Action::RefreshPrinters
+                self.continue_in_printer_application(web_interface_uri)
             }
-            Err(why) => {
-                tracing::error!(why, "failed to add discovered printer");
+            Err(SetupError::Failed(why)) => {
+                tracing::error!(why, "failed to configure discovered printer");
                 self.error = Some(why);
                 self.view = DialogView::Discovery;
                 Action::None
@@ -214,79 +254,142 @@ impl Page {
         }
     }
 
-    fn finish_web_page_open(&mut self, result: Result<(), String>) -> Action {
-        match result {
-            Ok(()) => Action::None,
-            Err(why) => {
-                tracing::error!(why, "failed to open printer web page");
-                self.error = Some(why);
+    fn apply_configuration(&mut self, reply: ConfigurePrinterReply) -> Action {
+        match reply.state {
+            PrinterConfigurationState::Creating
+            | PrinterConfigurationState::AwaitingAdvertisement => {
+                self.pending_operation = Some(reply.operation_id);
+                // Refreshing destinations is what lets the daemon match the new
+                // printer to the queue it eventually advertises.
+                Action::RefreshPrinters
+            }
+            PrinterConfigurationState::Reconciled
+            | PrinterConfigurationState::AlreadyConfigured => {
+                self.error = None;
+                self.added.push(AddedPrinter {
+                    name: reply.configured_printer_name,
+                    destination_id: reply.destination_id,
+                });
+                self.view = DialogView::Added;
+                // The printer that was just set up has to stop being offered, and
+                // only a fresh round can establish that.
+                Action::RediscoverPrinters
+            }
+            PrinterConfigurationState::ManualActionRequired => {
+                self.continue_in_printer_application(reply.web_interface_uri)
+            }
+            PrinterConfigurationState::UnknownOutcome | PrinterConfigurationState::Failed => {
+                self.error = Some(fl!("failed-to-add-printer"));
+                self.view = DialogView::Discovery;
                 Action::None
             }
         }
     }
 
-    fn discovered_printer(&self, printer_id: &str) -> Option<&PrinterEntry> {
-        self.discovered_printers
-            .iter()
-            .find(|printer| discovered_printer_id(printer) == printer_id)
+    fn continue_in_printer_application(&mut self, web_interface_uri: Option<String>) -> Action {
+        self.view = DialogView::ManualSetup;
+
+        match web_interface_uri {
+            Some(web_page) => Self::open_web_page(web_page),
+            None => {
+                self.error = Some(fl!("printer-application-web-interface-unavailable"));
+                Action::None
+            }
+        }
     }
 
-    fn printer_application(&self, application_id: &str) -> Option<&PrinterApplication> {
-        self.printer_applications
-            .iter()
-            .find(|application| application.id == application_id)
+    /// Reports a page that could not be opened by naming it.
+    ///
+    /// A session with no browser handler is not a reason to strand the user: the
+    /// address is the whole of what they need, so it is shown rather than the
+    /// failure of the tool that would have opened it.
+    fn finish_web_page_open(&mut self, result: Result<(), (String, String)>) -> Action {
+        if let Err((address, why)) = result {
+            tracing::error!(why, address, "failed to open printer web page");
+            self.error = Some(fl!(
+                "open-printer-application-page-manually",
+                address = address
+            ));
+        }
+
+        Action::None
     }
 
-    fn application_ids_for_printer(&self, printer: &PrinterEntry) -> Vec<String> {
-        // TODO: Replace endpoint association with backend-provided device/application
-        // matches once PAPPL-Find-Devices observations are exposed by the daemon.
-        self.printer_applications
-            .iter()
-            .filter(|application| application_matches_printer(application, printer))
-            .map(|application| application.id.clone())
-            .collect()
+    fn visible_printers(&self) -> impl Iterator<Item = &DiscoveredPhysicalPrinter> {
+        let search = self.search.trim().to_lowercase();
+
+        self.printers_to_set_up()
+            .filter(move |printer| printer_matches_search(printer, &search))
     }
 
-    fn printer_is_configured(&self, printer: &PrinterEntry) -> bool {
+    /// The printers still worth offering.
+    ///
+    /// A printer a Printer Application has already set up is left out: it is not
+    /// something to add, and adding it again would produce a second queue for one
+    /// printer.
+    fn printers_to_set_up(&self) -> impl Iterator<Item = &DiscoveredPhysicalPrinter> {
+        self.physical_printers()
+            .iter()
+            .filter(|printer| !is_configured(printer))
+    }
+
+    fn physical_printers(&self) -> &[DiscoveredPhysicalPrinter] {
+        self.discovery
+            .as_ref()
+            .map_or(&[], |discovery| discovery.physical_printers.as_slice())
+    }
+
+    fn physical_printer(&self, printer_id: &str) -> Option<&DiscoveredPhysicalPrinter> {
+        self.physical_printers()
+            .iter()
+            .find(|printer| printer.id == printer_id)
+    }
+
+    fn configured_printer(&self, destination_id: &str) -> Option<&PrinterEntry> {
         self.configured_printers
             .iter()
-            .any(|configured| discovered_queue_matches(configured, printer))
+            .find(|printer| printer.id() == destination_id)
+    }
+
+    fn selectable_generation(&self) -> Option<DiscoveryGeneration> {
+        self.discovery
+            .as_ref()
+            .filter(|discovery| !discovery.cached)
+            .map(|discovery| discovery.generation)
+    }
+
+    /// Whether every Printer Application in this round has answered.
+    ///
+    /// Rows appear as each application answers, so a row can be complete before the
+    /// round is. Nothing may be concluded from the absence of a candidate until this
+    /// is true.
+    fn every_application_answered(&self) -> bool {
+        self.discovery.as_ref().is_some_and(|discovery| {
+            discovery.completed_printer_application_scans
+                >= discovery.total_printer_application_scans
+        })
+    }
+
+    fn is_searching(&self) -> bool {
+        self.error.is_none()
+            && self
+                .discovery
+                .as_ref()
+                .is_none_or(|discovery| discovery.state == AddPrinterDiscoveryState::Searching)
     }
 
     fn is_adding(&self) -> bool {
         matches!(self.view, DialogView::Adding { .. })
     }
 
-    fn start_setup(&mut self, printer_id: String, application_id: Option<String>) -> Action {
-        if self.is_adding() {
-            return Action::None;
-        }
-
-        let Some(printer) = self.discovered_printer(&printer_id).cloned() else {
-            self.error = Some(fl!("no-printers-found"));
-            return Action::None;
-        };
-
-        self.error = None;
-        self.view = DialogView::Adding {
-            printer_id: printer_id.clone(),
-            application_id: application_id.clone(),
-        };
-
-        Action::Task(cosmic::task::future(async move {
-            crate::Message::PageMessage(crate::pages::Message::Printers(
-                Message::PrinterSetupFinished(
-                    setup_discovered_printer(printer_id, printer, application_id).await,
-                )
-                .into(),
-            ))
-        }))
-    }
-
     fn open_web_page(web_page: String) -> Action {
         Action::Task(cosmic::task::future(async move {
+            let opened = backend::open_printer_web_page(web_page.clone())
+                .await
+                .map_err(|why| (web_page, why));
+
             crate::Message::PageMessage(crate::pages::Message::Printers(
-                Message::WebPageOpened(backend::open_printer_web_page(web_page).await).into(),
+                Message::WebPageOpened(opened).into(),
             ))
         }))
     }
@@ -296,14 +399,26 @@ impl Page {
 pub enum Message {
     Close,
     Search(String),
-    DiscoveredPrintersLoaded(Result<Vec<PrinterEntry>, String>),
+    Loaded(Result<Load, String>),
+    ConfigurationChanged,
     OpenManualSetup,
     SelectDiscoveredPrinter(String),
     SelectPrinterApplication(String),
-    OpenPrinterApplication(String),
     OpenPrinterWebPage(String),
-    PrinterSetupFinished(Result<PrinterEntry, String>),
-    WebPageOpened(Result<(), String>),
+    PrinterSetupFinished(Result<ConfigurePrinterReply, SetupError>),
+    /// The address is carried back so a failure can name the page the user still
+    /// needs to reach.
+    WebPageOpened(Result<(), (String, String)>),
+}
+
+/// Why a configuration attempt could not complete here.
+///
+/// A Printer Application that cannot create the printer itself offers its own
+/// page instead, which is a different outcome from an outright failure.
+#[derive(Clone, Debug)]
+pub enum SetupError {
+    ManualSetup { web_interface_uri: Option<String> },
+    Failed(String),
 }
 
 impl From<Message> for super::Message {
@@ -322,55 +437,101 @@ pub enum Action {
     None,
     Close,
     RefreshPrinters,
+    /// Reload the printers and start a fresh round of discovery.
+    RediscoverPrinters,
     Task(Task<crate::Message>),
 }
 
-async fn load_discovered_printers() -> Result<Vec<PrinterEntry>, String> {
-    let mut client = printers_client::connect()
-        .await
-        .map_err(|why| why.to_string())?;
-    client
-        .start_discovery()
-        .await
-        .map_err(|why| why.to_string())?;
-    client
-        .discovered_printers()
-        .await
-        .map_err(|why| why.to_string())
+fn loaded_task(
+    load: impl Future<Output = Result<Load, String>> + Send + 'static,
+) -> Task<crate::Message> {
+    cosmic::task::future(async move {
+        crate::Message::PageMessage(crate::pages::Message::Printers(
+            Message::Loaded(load.await).into(),
+        ))
+    })
 }
 
-async fn setup_discovered_printer(
-    printer_id: String,
-    discovered: PrinterEntry,
-    application_id: Option<String>,
-) -> Result<PrinterEntry, String> {
+fn setup_task(request: ConfigureDiscoveredPrinterRequest) -> Task<crate::Message> {
+    cosmic::task::future(async move {
+        crate::Message::PageMessage(crate::pages::Message::Printers(
+            Message::PrinterSetupFinished(configure(request).await).into(),
+        ))
+    })
+}
+
+async fn start_discovery() -> Result<Load, String> {
+    let mut client = printers_client::connect()
+        .await
+        .map_err(|why| why.to_string())?;
+    client
+        .start_add_printer_discovery()
+        .await
+        .map_err(|why| why.to_string())?;
+
+    discovery_load(&mut client).await
+}
+
+async fn load() -> Result<Load, String> {
     let mut client = printers_client::connect()
         .await
         .map_err(|why| why.to_string())?;
 
-    // TODO: Pass application_id once the daemon add API supports selecting a
-    // specific Printer Application. The state machine already preserves it.
-    let _ = application_id;
-    client
-        .add_discovered_printer(&printer_id)
+    discovery_load(&mut client).await
+}
+
+async fn discovery_load(client: &mut printers_client::Client) -> Result<Load, String> {
+    let discovery = client
+        .add_printer_discovery()
+        .await
+        .map_err(|why| why.to_string())?;
+    let manual_setup_applications = client
+        .manual_setup_printer_applications()
         .await
         .map_err(|why| why.to_string())?;
 
-    let configured = client.printers().await.map_err(|why| why.to_string())?;
+    Ok(Load {
+        discovery,
+        manual_setup_applications,
+    })
+}
 
-    configured
-        .into_iter()
-        .find(|printer| discovered_queue_matches(printer, &discovered))
-        .ok_or_else(|| fl!("configured-printer-not-found"))
+async fn configure(
+    request: ConfigureDiscoveredPrinterRequest,
+) -> Result<ConfigurePrinterReply, SetupError> {
+    let mut client = printers_client::connect().await.map_err(setup_error)?;
+
+    client
+        .configure_discovered_printer(request)
+        .await
+        .map_err(setup_error)
+}
+
+async fn printer_configuration(operation_id: String) -> Result<ConfigurePrinterReply, SetupError> {
+    let mut client = printers_client::connect().await.map_err(setup_error)?;
+
+    client
+        .printer_configuration(&operation_id)
+        .await
+        .map_err(setup_error)
+}
+
+fn setup_error(error: printers_client::ClientError) -> SetupError {
+    match error {
+        printers_client::ClientError::Service(
+            PrinterError::PrinterConfigurationManualActionRequired {
+                web_interface_uri, ..
+            },
+        ) => SetupError::ManualSetup { web_interface_uri },
+        error => SetupError::Failed(error.to_string()),
+    }
 }
 
 pub fn dialog(page: &Page) -> Element<'_, crate::pages::Message> {
     let body = match &page.view {
         DialogView::Discovery | DialogView::Adding { .. } => discovery_view(page),
         DialogView::ManualSetup => manual_setup_view(page),
-        DialogView::SelectApplication {
-            application_ids, ..
-        } => select_application_view(page, application_ids),
+        DialogView::SelectApplication { printer_id } => select_application_view(page, printer_id),
         DialogView::Added => added_printers_view(page),
     };
     let footer_label = match page.view {
@@ -406,7 +567,7 @@ fn discovery_view(page: &Page) -> Element<'_, Message> {
         .spacing(16)
         .push(search)
         .push(printers_section(page));
-    if !page.loading {
+    if !page.is_searching() {
         settings = settings.push(manual_setup_prompt());
     }
 
@@ -419,11 +580,15 @@ fn discovery_view(page: &Page) -> Element<'_, Message> {
 }
 
 fn manual_setup_view(page: &Page) -> Element<'_, Message> {
-    let mut rows = Vec::with_capacity(page.printer_applications.len().max(1) + 1);
+    let mut rows = Vec::with_capacity(page.manual_setup_applications.len().max(1) + 1);
     if let Some(error) = &page.error {
         rows.push(plain_row(error.clone()));
     }
-    rows.extend(page.printer_applications.iter().map(manual_application_row));
+    rows.extend(
+        page.manual_setup_applications
+            .iter()
+            .map(manual_application_row),
+    );
     if rows.is_empty() {
         rows.push(plain_row(fl!("no-printer-applications-found")));
     }
@@ -440,14 +605,20 @@ fn manual_setup_view(page: &Page) -> Element<'_, Message> {
     )
 }
 
-fn select_application_view<'a>(page: &'a Page, application_ids: &[String]) -> Element<'a, Message> {
-    let rows = with_dividers(
-        application_ids
-            .iter()
-            .filter_map(|id| page.printer_application(id))
-            .map(select_application_row)
-            .collect(),
-    );
+fn select_application_view<'a>(page: &'a Page, printer_id: &str) -> Element<'a, Message> {
+    let rows = page
+        .physical_printer(printer_id)
+        .map(|printer| {
+            with_dividers(
+                printer
+                    .candidates
+                    .iter()
+                    .filter(|candidate| is_selectable(candidate.state))
+                    .map(select_application_row)
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
 
     padded_content(
         column::with_capacity(2)
@@ -465,7 +636,12 @@ fn select_application_view<'a>(page: &'a Page, application_ids: &[String]) -> El
 }
 
 fn added_printers_view(page: &Page) -> Element<'_, Message> {
-    let rows = with_dividers(page.added_printers.iter().map(added_printer_row).collect());
+    let rows = with_dividers(
+        page.added
+            .iter()
+            .map(|added| added_printer_row(page, added))
+            .collect(),
+    );
     let description = row::with_capacity(2)
         .spacing(4)
         .align_y(Alignment::End)
@@ -507,7 +683,7 @@ fn padded_content<'a>(
 }
 
 fn printers_section(page: &Page) -> Element<'_, Message> {
-    let (rows, printer_count, row_height) = if page.loading {
+    let (rows, printer_count, row_height) = if page.is_searching() {
         (vec![plain_row(fl!("searching"))], 1, APPLICATION_ROW_HEIGHT)
     } else if let Some(error) = &page.error {
         (vec![plain_row(error.clone())], 1, APPLICATION_ROW_HEIGHT)
@@ -553,21 +729,21 @@ fn manual_setup_prompt() -> Element<'static, Message> {
         .into()
 }
 
-fn discovered_printer_row(page: &Page, printer: &PrinterEntry) -> Element<'static, Message> {
-    let printer_id = discovered_printer_id(printer);
+fn discovered_printer_row(
+    page: &Page,
+    printer: &DiscoveredPhysicalPrinter,
+) -> Element<'static, Message> {
+    let printer_id = printer.id.clone();
     let connecting = matches!(
         &page.view,
-        DialogView::Adding {
-            printer_id: adding_id,
-            ..
-        } if adding_id == &printer_id
+        DialogView::Adding { printer_id: adding_id } if adding_id == &printer_id
     );
     let status = if connecting {
         fl!("connecting")
     } else {
-        printer_location_label(printer)
+        candidate_summary(printer, page.every_application_answered())
     };
-    let content = two_line_printer_content(printer, status, connecting, None);
+    let content = two_line_printer_content(printer.display_name.clone(), status, connecting, None);
 
     button::custom(content)
         .padding([8, 24])
@@ -578,24 +754,31 @@ fn discovered_printer_row(page: &Page, printer: &PrinterEntry) -> Element<'stati
         .into()
 }
 
-fn added_printer_row(printer: &PrinterEntry) -> Element<'static, Message> {
-    let trailing = printer.web_page().map(|web_page| {
-        button::custom(
-            icon::from_name("view-web-browser-symbolic")
-                .size(16)
-                .icon()
-                .class(cosmic::theme::Svg::Custom(primary_svg())),
-        )
-        .padding(8)
-        .width(Length::Fixed(32.0))
-        .height(Length::Fixed(32.0))
-        .class(cosmic::theme::Button::Transparent)
-        .on_press(Message::OpenPrinterWebPage(web_page.to_string()))
-        .into()
-    });
+fn added_printer_row(page: &Page, added: &AddedPrinter) -> Element<'static, Message> {
+    let destination = added
+        .destination_id
+        .as_deref()
+        .and_then(|destination_id| page.configured_printer(destination_id));
+    let name = destination.map_or_else(|| added.name.clone(), printer_display_name);
+    let trailing = destination
+        .and_then(PrinterEntry::web_page)
+        .map(|web_page| {
+            button::custom(
+                icon::from_name("view-web-browser-symbolic")
+                    .size(16)
+                    .icon()
+                    .class(cosmic::theme::Svg::Custom(primary_svg())),
+            )
+            .padding(8)
+            .width(Length::Fixed(32.0))
+            .height(Length::Fixed(32.0))
+            .class(cosmic::theme::Button::Transparent)
+            .on_press(Message::OpenPrinterWebPage(web_page.to_string()))
+            .into()
+        });
 
     container(two_line_printer_content(
-        printer,
+        name,
         fl!("printer-ready"),
         true,
         trailing,
@@ -607,7 +790,7 @@ fn added_printer_row(printer: &PrinterEntry) -> Element<'static, Message> {
 }
 
 fn two_line_printer_content(
-    printer: &PrinterEntry,
+    name: String,
     caption: String,
     checked: bool,
     trailing: Option<Element<'static, Message>>,
@@ -623,7 +806,7 @@ fn two_line_printer_content(
     };
     let copy = column::with_capacity(2)
         .spacing(0)
-        .push(row_label(printer_display_name(printer)))
+        .push(row_label(name))
         .push(
             text::caption(caption)
                 .class(cosmic::theme::Text::Color(TEXT_MUTED))
@@ -650,8 +833,9 @@ fn two_line_printer_content(
     content.width(Length::Fill).into()
 }
 
-fn manual_application_row(application: &PrinterApplication) -> Element<'static, Message> {
-    let application_id = application.id.clone();
+fn manual_application_row(
+    application: &ManualSetupPrinterApplication,
+) -> Element<'static, Message> {
     row::with_capacity(2)
         .align_y(Alignment::Center)
         .spacing(16)
@@ -662,7 +846,9 @@ fn manual_application_row(application: &PrinterApplication) -> Element<'static, 
                 .width(Length::Fixed(122.0))
                 .height(Length::Fixed(32.0))
                 .class(cosmic::theme::Button::Transparent)
-                .on_press(Message::OpenPrinterApplication(application_id)),
+                .on_press(Message::OpenPrinterWebPage(
+                    application.web_interface_uri.clone(),
+                )),
         )
         .padding([8, 24])
         .width(Length::Fill)
@@ -670,7 +856,9 @@ fn manual_application_row(application: &PrinterApplication) -> Element<'static, 
         .into()
 }
 
-fn select_application_row(application: &PrinterApplication) -> Element<'static, Message> {
+fn select_application_row(
+    candidate: &PrinterApplicationCandidateSummary,
+) -> Element<'static, Message> {
     let chevron: Element<'static, Message> = container(
         icon::from_name("go-next-symbolic")
             .size(16)
@@ -686,14 +874,14 @@ fn select_application_row(application: &PrinterApplication) -> Element<'static, 
         row::with_capacity(2)
             .align_y(Alignment::Center)
             .spacing(16)
-            .push(row_label(application_display_name(application)))
+            .push(row_label(candidate.printer_application_name.clone()))
             .push(chevron),
     )
     .padding([8, 24])
     .width(Length::Fill)
     .height(Length::Fixed(APPLICATION_ROW_HEIGHT))
     .class(cosmic::theme::Button::Transparent)
-    .on_press(Message::SelectPrinterApplication(application.id.clone()))
+    .on_press(Message::SelectPrinterApplication(candidate.id.clone()))
     .into()
 }
 
@@ -821,134 +1009,84 @@ fn printer_display_name(printer: &PrinterEntry) -> String {
     .unwrap_or_else(|| fl!("generic-printer"))
 }
 
-fn application_display_name(application: &PrinterApplication) -> String {
-    non_empty(&application.service_name)
+fn application_display_name(application: &ManualSetupPrinterApplication) -> String {
+    non_empty(&application.display_name)
         .map(str::to_string)
-        .or_else(|| {
-            application
-                .make_and_model
-                .as_deref()
-                .and_then(non_empty)
-                .map(str::to_string)
-        })
         .unwrap_or_else(|| fl!("generic-printer-application"))
 }
 
-fn printer_location_label(printer: &PrinterEntry) -> String {
+/// Names the Printer Applications offering to set this printer up.
+///
+/// A Printer Application reports every printer it can see, whether or not it has
+/// a driver for it, so a row can be real and still have nobody to drive it. Saying
+/// how many applications saw it reads as the truth rather than as a contradiction
+/// of the row being there at all.
+///
+/// Until every application has answered, saying nothing can drive this printer
+/// would be asserting something not yet known — the application with the driver may
+/// be the one still being asked. So while a round is running the row says it is
+/// still looking.
+fn candidate_summary(printer: &DiscoveredPhysicalPrinter, every_answer_in: bool) -> String {
+    let names = printer
+        .candidates
+        .iter()
+        .filter(|candidate| is_selectable(candidate.state))
+        .map(|candidate| candidate.printer_application_name.as_str())
+        .collect::<Vec<_>>();
+
+    if !names.is_empty() {
+        return names.join(", ");
+    }
+    if !every_answer_in {
+        return fl!("searching");
+    }
+
+    match printer.candidates.len() {
+        0 => fl!("no-compatible-printer-applications"),
+        count => fl!("seen-without-a-driver", count = count),
+    }
+}
+
+/// Whether a Printer Application can be chosen to set this printer up.
+fn is_selectable(state: PaCandidateState) -> bool {
+    state == PaCandidateState::Ready
+}
+
+/// Whether a Printer Application has already set this printer up.
+fn is_configured(printer: &DiscoveredPhysicalPrinter) -> bool {
     printer
-        .location()
-        .and_then(non_empty)
-        .map(str::to_string)
-        .unwrap_or_else(|| fl!("printer-location-unknown"))
+        .candidates
+        .iter()
+        .any(|candidate| candidate.state == PaCandidateState::AlreadyConfigured)
 }
 
-fn printer_matches_search(printer: &PrinterEntry, search: &str) -> bool {
+fn selectable_candidate_ids(printer: &DiscoveredPhysicalPrinter) -> Vec<String> {
+    printer
+        .candidates
+        .iter()
+        .filter(|candidate| is_selectable(candidate.state))
+        .map(|candidate| candidate.id.clone())
+        .collect()
+}
+
+fn printer_matches_search(printer: &DiscoveredPhysicalPrinter, search: &str) -> bool {
     search.is_empty()
-        || printer.name().to_lowercase().contains(search)
+        || printer.display_name.to_lowercase().contains(search)
         || printer
-            .model()
+            .make_and_model
+            .as_deref()
             .is_some_and(|value| value.to_lowercase().contains(search))
-        || printer
-            .location()
-            .is_some_and(|value| value.to_lowercase().contains(search))
-        || printer
-            .device_uri()
-            .is_some_and(|value| value.to_lowercase().contains(search))
-}
-
-fn application_matches_printer(application: &PrinterApplication, printer: &PrinterEntry) -> bool {
-    let uri_endpoint = printer.device_uri().and_then(uri_endpoint);
-    let Some(printer_port) = printer
-        .port()
-        .or_else(|| uri_endpoint.as_ref().map(|(_, port)| *port))
-    else {
-        return false;
-    };
-    if application.port != printer_port {
-        return false;
-    }
-
-    let uri_host = uri_endpoint.as_ref().map(|(host, _)| host.as_str());
-    let printer_hosts = printer
-        .dnssd_address()
-        .and_then(non_empty)
-        .into_iter()
-        .chain(printer.hostname().and_then(non_empty))
-        .chain(uri_host);
-
-    printer_hosts.into_iter().any(|printer_host| {
-        let printer_host = normalize_host(printer_host);
-        std::iter::once(application.hostname.as_str())
-            .chain(application.addresses.iter().map(String::as_str))
-            .any(|host| normalize_host(host) == printer_host)
-    })
-}
-
-fn uri_endpoint(uri: &str) -> Option<(String, u16)> {
-    let (scheme, rest) = uri.split_once("://")?;
-    let authority = rest.split('/').next()?.trim_matches(['[', ']']);
-    let default_port = match scheme {
-        "ipp" | "ipps" => 631,
-        "http" => 80,
-        "https" => 443,
-        _ => return None,
-    };
-    let (host, port) = authority
-        .rsplit_once(':')
-        .and_then(|(host, port)| port.parse().ok().map(|port| (host, port)))
-        .unwrap_or((authority, default_port));
-    Some((host.trim_matches(['[', ']']).to_string(), port))
-}
-
-fn normalize_host(host: &str) -> String {
-    host.trim_matches(['[', ']'])
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
-}
-
-fn discovered_queue_matches(configured: &PrinterEntry, discovered: &PrinterEntry) -> bool {
-    if !discovered.id().is_empty() && queue_name(configured.id()) == discovered.id() {
-        return true;
-    }
-
-    printer_device_uri(configured)
-        .zip(printer_device_uri(discovered))
-        .is_some_and(|(configured_uri, discovered_uri)| {
-            normalized_uri(configured_uri) == normalized_uri(discovered_uri)
+        || printer.candidates.iter().any(|candidate| {
+            candidate
+                .printer_application_name
+                .to_lowercase()
+                .contains(search)
         })
-}
-
-fn queue_name(printer_id: &str) -> &str {
-    printer_id
-        .split_once('/')
-        .map_or(printer_id, |(queue_name, _)| queue_name)
-}
-
-fn discovered_printer_id(printer: &PrinterEntry) -> String {
-    let service_type = printer.option("dnssd-service-type").unwrap_or_default();
-    let domain = printer.option("dnssd-domain").unwrap_or_default();
-    let name = printer
-        .option("dnssd-service-name")
-        .unwrap_or_else(|| printer.name());
-
-    format!("dnssd:{service_type}:{domain}:{name}")
-}
-
-fn printer_device_uri(printer: &PrinterEntry) -> Option<&str> {
-    printer.device_uri().or_else(|| printer.printer_local_uri())
 }
 
 fn non_empty(value: &str) -> Option<&str> {
     let value = value.trim();
     (!value.is_empty()).then_some(value)
-}
-
-fn normalized_uri(uri: &str) -> String {
-    uri.split(['?', '#'])
-        .next()
-        .unwrap_or(uri)
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
 }
 
 fn dialog_container() -> cosmic::theme::Container<'static> {

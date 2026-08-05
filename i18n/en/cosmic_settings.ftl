@@ -1052,13 +1052,19 @@ added-printers = Added printers
 printer-web-interface-description = Your printer has a web interface where you can configure additional options, perform maintenance, and order supplies. Click the Printer web interface button to access it.
 no-printer-applications-found = No printer applications found
 no-compatible-printer-applications = No compatible printer application was found for this printer
+seen-without-a-driver = Seen by { $count } printer { $count ->
+        [1] application
+        *[other] applications
+    }, no driver available
 printer-application-web-interface-unavailable = This printer application does not provide a web interface
+open-printer-application-page-manually = Could not open a browser. Set this printer up at { $address }
 configured-printer-not-found = The configured printer could not be loaded
 printer-location-unknown = Location unknown
 generic-printer = Printer
 generic-printer-application = Printer application
 no-printers-found = No printers found
 failed-to-load-printers = Failed to load printers
+failed-to-add-printer = Failed to add printer
 default-printer = Default printer
 default-printer-not-set = Not set
 set-as-default-printer = Set as default printer
