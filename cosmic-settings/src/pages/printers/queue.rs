@@ -123,6 +123,11 @@ pub enum Message {
         printer_id: String,
         result: Result<(), String>,
     },
+    PrintTestPage,
+    TestPageFinished {
+        printer_id: String,
+        result: Result<i32, String>,
+    },
     Refresh,
     ToggleCompleted,
     OpenPrinterWebPage(String),
@@ -245,6 +250,10 @@ impl Page {
             Message::RunJobAction(operation) => self.start_job_action(operation),
             Message::JobActionFinished { printer_id, result } => {
                 self.finish_job_action(printer_id, result)
+            }
+            Message::PrintTestPage => self.start_test_page(),
+            Message::TestPageFinished { printer_id, result } => {
+                self.finish_test_page(printer_id, result)
             }
             Message::Refresh => {
                 self.menu = None;
@@ -417,6 +426,64 @@ impl Page {
         if let Err(why) = result {
             tracing::warn!(printer_id, why, "print job operation failed");
             self.error = Some(why);
+        }
+
+        Task::batch([
+            self.load_jobs_task(),
+            cosmic::task::message(crate::app::Message::PageMessage(
+                crate::pages::Message::Printers(super::Message::Refresh),
+            )),
+        ])
+    }
+
+    fn start_test_page(&mut self) -> Task<crate::Message> {
+        if self.operation_in_flight {
+            return Task::none();
+        }
+
+        self.menu = None;
+
+        let Some(printer_id) = self
+            .printer
+            .as_ref()
+            .map(|printer| printer.id().to_string())
+        else {
+            return Task::none();
+        };
+
+        // Printing to a destination that has no queue yet waits for CUPS to make one,
+        // which takes a few seconds, so the queue stays busy until it answers.
+        self.operation_in_flight = true;
+
+        cosmic::task::future(async move {
+            let result = print_test_page(printer_id.clone()).await;
+            crate::Message::PageMessage(crate::pages::Message::PrinterQueue(
+                Message::TestPageFinished { printer_id, result },
+            ))
+        })
+    }
+
+    fn finish_test_page(
+        &mut self,
+        printer_id: String,
+        result: Result<i32, String>,
+    ) -> Task<crate::Message> {
+        if !self.is_current_printer(&printer_id) {
+            return Task::none();
+        }
+
+        self.operation_in_flight = false;
+        match result {
+            Ok(job_id) => {
+                tracing::info!(printer_id, job_id, "queued a test page");
+            }
+            // Nothing was queued, so there is nothing to reload — and reloading is
+            // what would erase this message before it could be read.
+            Err(why) => {
+                tracing::warn!(printer_id, why, "failed to print a test page");
+                self.error = Some(why);
+                return Task::none();
+            }
         }
 
         Task::batch([
@@ -773,7 +840,7 @@ fn global_queue_menu(page: &Page) -> Element<'static, Message> {
         .and_then(|printer| printer.web_page().map(str::to_owned));
 
     menu_surface(
-        column::with_capacity(11)
+        column::with_capacity(13)
             .push(menu_row(
                 fl!("cancel-all"),
                 JobOperation::new(JobAction::Cancel, cancelable).map(Message::RunJobAction),
@@ -787,6 +854,13 @@ fn global_queue_menu(page: &Page) -> Element<'static, Message> {
                 JobOperation::new(JobAction::Resume, resumable).map(Message::RunJobAction),
             ))
             .push(menu_row(fl!("refresh-all"), Some(Message::Refresh)))
+            .push(widgets::inset_divider(8))
+            // Its own group: the rows above act on jobs that are already here, and
+            // this one adds a job.
+            .push(menu_row(
+                fl!("print-test-page"),
+                (!page.operation_in_flight).then_some(Message::PrintTestPage),
+            ))
             .push(widgets::inset_divider(8))
             .push(menu_toggle_row(
                 fl!("show-completed-jobs"),
@@ -1035,6 +1109,16 @@ async fn load_jobs(printer_id: String, filter: JobFilter) -> Result<Vec<JobInfo>
         .map_err(|why| why.to_string())?;
     client
         .jobs(&printer_id, filter)
+        .await
+        .map_err(|why| why.to_string())
+}
+
+async fn print_test_page(printer_id: String) -> Result<i32, String> {
+    let mut client = printers_client::connect()
+        .await
+        .map_err(|why| why.to_string())?;
+    client
+        .print_test_page(&printer_id)
         .await
         .map_err(|why| why.to_string())
 }

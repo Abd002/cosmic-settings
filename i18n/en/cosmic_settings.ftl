@@ -1088,6 +1088,7 @@ cancel-all = Cancel all
 pause-all = Pause all
 resume-all = Resume all
 refresh-all = Refresh all
+print-test-page = Print test page
 show-completed-jobs = Show completed jobs
 move-to-printer = Move to printer
 job-pending = Pending
