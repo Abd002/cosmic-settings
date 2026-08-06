@@ -1,4 +1,5 @@
 use cosmic::app::Task;
+use cosmic::iced::border::Radius;
 use cosmic::iced::{Alignment, Color, Length, Subscription, event, keyboard};
 use cosmic::iced_core::text::{Ellipsize, EllipsizeHeightLimit, Wrapping};
 use cosmic::widget::{
@@ -6,12 +7,16 @@ use cosmic::widget::{
 };
 use cosmic::{Apply, Element};
 use cosmic_settings_page::{self as page, Section, section};
-use cosmic_settings_printers_core::{PrinterStatus, SupplyLevel};
+use cosmic_settings_printers_core::{PrinterStatus, SupplyLevel, SupplyRgb, SupplyWarning};
 use slotmap::SlotMap;
 
 use super::style::{
-    ACCENT, BLACK_SUPPLY, BODY_TEXT, CARD_BG, DIVIDER, FONT_SEMIBOLD, RADIUS_CARD, REMOVE_BG,
-    REMOVE_TEXT, SECONDARY_TEXT, STATUS_READY, STATUS_STOPPED, SUPPLY_TRACK, TITLE_TEXT,
+    ACCENT, BODY_TEXT, CARD_BG, DIVIDER, FONT_SEMIBOLD, RADIUS_CARD, RADIUS_PILL,
+    RADIUS_SUPPLY_BAR, REMOVE_BG, REMOVE_TEXT, SECONDARY_TEXT, STATUS_READY, STATUS_STOPPED,
+    SUPPLY_BAR_HEIGHT, SUPPLY_CARD_PADDING_Y, SUPPLY_COLUMN_SPACING, SUPPLY_DOT_SIZE,
+    SUPPLY_GRAPH_HEIGHT, SUPPLY_LABEL_HEIGHT, SUPPLY_MARK_HEIGHT, SUPPLY_MARK_WIDTH,
+    SUPPLY_MIN_CHANNEL, SUPPLY_NEUTRAL, SUPPLY_OUTLINE_TOLERANCE, SUPPLY_PERCENTAGE_WIDTH,
+    SUPPLY_ROW_SPACING, SUPPLY_TRACK, SUPPLY_TRACK_HEIGHT, TITLE_TEXT,
 };
 use super::{PrinterEntry, backend, widgets};
 
@@ -42,6 +47,10 @@ pub enum Message {
     ToggleDefaultPrinter(String, bool),
     PrinterDefaultSet(Result<(), String>),
     PrinterLocationSet(Result<(), String>),
+    SuppliesLoaded {
+        printer_id: String,
+        result: Result<Vec<SupplyLevel>, String>,
+    },
 }
 
 impl From<Message> for crate::pages::Message {
@@ -66,6 +75,9 @@ pub struct Page {
     is_default: bool,
     paper_size_dropdown_open: bool,
     print_sides_dropdown_open: bool,
+    /// What the printer last said it holds. Empty until it answers, and for a printer
+    /// that reports nothing — which is most of them.
+    supplies: Vec<SupplyLevel>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +100,7 @@ impl Default for Page {
             is_default: false,
             paper_size_dropdown_open: false,
             print_sides_dropdown_open: false,
+            supplies: Vec::new(),
         }
     }
 }
@@ -181,6 +194,7 @@ impl Page {
                 queue_page,
                 available_printers,
             } => {
+                let printer_id = printer.id().to_string();
                 self.load_printer(
                     printer,
                     is_default,
@@ -188,6 +202,10 @@ impl Page {
                     queue_page,
                     available_printers,
                 );
+                load_supplies_task(printer_id)
+            }
+            Message::SuppliesLoaded { printer_id, result } => {
+                self.apply_supplies(printer_id, result);
                 Task::none()
             }
             Message::CancelDialog => {
@@ -254,6 +272,25 @@ impl Page {
         self.available_printers = available_printers;
         self.paper_size_dropdown_open = false;
         self.print_sides_dropdown_open = false;
+        // What the last printer held says nothing about this one.
+        self.supplies = Vec::new();
+    }
+
+    /// Keeps what a printer answered, if it is still the printer being shown.
+    fn apply_supplies(&mut self, printer_id: String, result: Result<Vec<SupplyLevel>, String>) {
+        if self.printer.as_ref().map(PrinterEntry::id) != Some(printer_id.as_str()) {
+            return;
+        }
+
+        match result {
+            Ok(supplies) => self.supplies = supplies,
+            // A printer that cannot say what it holds shows no supplies, which is the
+            // same as one that holds none it can report.
+            Err(why) => {
+                tracing::warn!(printer_id, why, "failed to load printer supplies");
+                self.supplies = Vec::new();
+            }
+        }
     }
 
     fn update_location_draft(&mut self, location: String) {
@@ -505,7 +542,7 @@ fn details_content<'a>(
         .push(default_queue_card(printer, is_default))
         .push(info_card(printer))
         .push(preferences_card(page, printer))
-        .push(supplies_section(printer))
+        .push_maybe(supplies_section(&page.supplies))
         .push(remove_printer_action(printer))
         .into()
 }
@@ -767,51 +804,87 @@ fn sides_label(value: &str) -> String {
     }
 }
 
-fn supplies_section(printer: &PrinterEntry) -> Element<'static, Message> {
-    let supplies = printer.supplies();
-    let color_supply = find_supply(&supplies, "tri")
-        .or_else(|| find_supply(&supplies, "color"))
-        .or_else(|| supplies.first());
-    let black_supply = find_supply(&supplies, "black")
-        .or_else(|| supplies.get(1))
-        .or(color_supply);
+/// Asks the service what a printer holds.
+fn load_supplies_task(printer_id: String) -> Task<crate::Message> {
+    cosmic::task::future(async move {
+        let result = backend::printer_supplies(printer_id.clone()).await;
+        crate::Message::PageMessage(crate::pages::Message::PrinterDetails(
+            Message::SuppliesLoaded { printer_id, result },
+        ))
+    })
+}
 
-    column::with_capacity(2)
+/// How many supplies stand side by side.
+const SUPPLY_COLUMNS: usize = 2;
+
+/// Draws the supplies a printer reports, two to a row.
+///
+/// Rows are decided before layout runs, so which supplies share a row never changes
+/// with the width of the pane — only how wide each of them is. A printer that reports
+/// nothing gets no card at all rather than invented bars.
+fn supplies_section(supplies: &[SupplyLevel]) -> Option<Element<'static, Message>> {
+    if supplies.is_empty() {
+        return None;
+    }
+
+    let rows = supply_rows(supplies.len());
+    let mut grid = column::with_capacity(rows)
         .width(Length::Fill)
-        .spacing(8)
-        .push(
-            text::body(fl!("supplies"))
-                .size(14)
-                .font(FONT_SEMIBOLD)
-                .class(BODY_TEXT)
-                .height(Length::Fixed(21.0)),
-        )
-        .push(
-            container(
-                row::with_capacity(2)
-                    .width(Length::Fill)
-                    .height(Length::Fixed(45.0))
-                    .spacing(16)
-                    .align_y(Alignment::Center)
-                    .push(supply_graph(
-                        supply_label(color_supply, "Tricolor cartridge"),
-                        color_supply.map_or(0, |supply| supply.level_percent),
-                        ACCENT,
-                        true,
-                    ))
-                    .push(supply_graph(
-                        supply_label(black_supply, "Black"),
-                        black_supply.map_or(0, |supply| supply.level_percent),
-                        BLACK_SUPPLY,
-                        false,
-                    )),
-            )
+        .spacing(SUPPLY_ROW_SPACING);
+
+    for chunk in supplies.chunks(SUPPLY_COLUMNS) {
+        let mut cells = row::with_capacity(SUPPLY_COLUMNS)
             .width(Length::Fill)
-            .height(Length::Fixed(61.0))
-            .padding([8, 24])
-            .class(widgets::fill_container(CARD_BG, RADIUS_CARD)),
-        )
-        .into()
+            .height(Length::Fixed(SUPPLY_GRAPH_HEIGHT))
+            .spacing(SUPPLY_COLUMN_SPACING);
+
+        for supply in chunk {
+            cells = cells.push(supply_graph(supply));
+        }
+        // A row holding one supply keeps the column the other would have used, so the
+        // one above it is not stretched across the whole card.
+        for _ in chunk.len()..SUPPLY_COLUMNS {
+            cells = cells.push(horizontal_space());
+        }
+
+        grid = grid.push(cells);
+    }
+
+    Some(
+        column::with_capacity(2)
+            .width(Length::Fill)
+            .spacing(8)
+            .push(
+                text::body(fl!("supplies"))
+                    .size(14)
+                    .font(FONT_SEMIBOLD)
+                    .class(BODY_TEXT)
+                    .height(Length::Fixed(21.0)),
+            )
+            .push(
+                container(grid)
+                    .width(Length::Fill)
+                    .height(Length::Fixed(supplies_card_height(rows)))
+                    .padding([SUPPLY_CARD_PADDING_Y as u16, 24])
+                    .class(widgets::fill_container(CARD_BG, RADIUS_CARD)),
+            )
+            .into(),
+    )
+}
+
+/// How many rows a count of supplies fills, two to a row.
+fn supply_rows(supplies: usize) -> usize {
+    supplies.div_ceil(SUPPLY_COLUMNS)
+}
+
+/// The height a card of supplies needs: its padding, a graph per row, and a gap
+/// between rows.
+fn supplies_card_height(rows: usize) -> f32 {
+    let rows = rows.max(1) as f32;
+
+    2.0 * SUPPLY_CARD_PADDING_Y
+        + rows * SUPPLY_GRAPH_HEIGHT
+        + (rows - 1.0) * f32::from(SUPPLY_ROW_SPACING)
 }
 
 fn remove_printer_action(printer: &PrinterEntry) -> Element<'static, Message> {
@@ -928,109 +1001,370 @@ fn right_value(value: String, width: f32) -> Element<'static, Message> {
         .into()
 }
 
-fn supply_graph(
-    label: String,
-    percent: u8,
-    fill: Color,
-    tricolor: bool,
-) -> Element<'static, Message> {
+/// One supply: what it is called, and how full it is.
+fn supply_graph(supply: &SupplyLevel) -> Element<'static, Message> {
+    let colors = bar_colors(supply);
+
     column::with_capacity(2)
-        .width(Length::Fixed(272.0))
-        .height(Length::Fixed(45.0))
-        .spacing(4)
+        .width(Length::Fill)
+        .height(Length::Fixed(SUPPLY_GRAPH_HEIGHT))
+        // No gap: the label's line box and the bar's row stack straight onto each other.
         .push(
             row::with_capacity(2)
-                .height(Length::Fixed(21.0))
+                .height(Length::Fixed(SUPPLY_LABEL_HEIGHT))
                 .align_y(Alignment::Center)
                 .spacing(8)
-                .push(text::body(label).size(14).class(BODY_TEXT))
-                .push_maybe(tricolor.then(tricolor_indicator)),
+                .push(
+                    text::body(supply_name(supply))
+                        .size(14)
+                        .class(TITLE_TEXT)
+                        .width(Length::Fill)
+                        .wrapping(Wrapping::None)
+                        .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1))),
+                )
+                // A cartridge holding several inks says which, where a bar so short it
+                // is a few pixels wide could not.
+                .push_maybe((colors.len() > 1).then(|| color_dots(&colors))),
         )
         .push(
             row::with_capacity(2)
-                .height(Length::Fixed(20.0))
+                .height(Length::Fixed(SUPPLY_BAR_HEIGHT))
                 .align_y(Alignment::Center)
                 .spacing(0)
-                .push(progress_track(percent, fill))
-                .push(
-                    container(
-                        text::body(format!("{:.1}%", percent as f32))
-                            .size(14)
-                            .class(TITLE_TEXT)
-                            .align_x(Alignment::Start),
-                    )
-                    .width(Length::Fixed(48.0))
-                    .height(Length::Fixed(20.0))
-                    .padding([0, 0, 0, 8])
-                    .align_y(Alignment::Center),
-                ),
+                .push(progress_track(supply, &colors))
+                .push(supply_percentage(supply.level_percent)),
         )
         .into()
 }
 
-fn progress_track(percent: u8, fill: Color) -> Element<'static, Message> {
-    let fill_portion = percent.min(100) as u16;
-    let empty_portion = 100_u16.saturating_sub(fill_portion);
-    let mut bar = row::with_capacity(2).height(Length::Fixed(12.0));
+/// What to call a supply the printer named nothing.
+fn supply_name(supply: &SupplyLevel) -> String {
+    if supply.name.is_empty() {
+        fl!("supply-unnamed")
+    } else {
+        supply.name.clone()
+    }
+}
 
-    if fill_portion > 0 {
+/// The level as text.
+///
+/// A full supply is written without a decimal, which is the one value that would not
+/// fit the width the design gives it.
+fn supply_percentage(level: Option<u8>) -> Element<'static, Message> {
+    container(
+        text::body(percentage_label(level))
+            .size(14)
+            .class(TITLE_TEXT)
+            .wrapping(Wrapping::None)
+            .align_x(Alignment::Start),
+    )
+    .width(Length::Fixed(SUPPLY_PERCENTAGE_WIDTH))
+    .height(Length::Fixed(SUPPLY_BAR_HEIGHT))
+    .padding([0, 0, 0, 8])
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn percentage_label(level: Option<u8>) -> String {
+    match level {
+        Some(level) if level >= 100 => "100%".to_string(),
+        Some(level) => format!("{:.1}%", f32::from(level)),
+        None => fl!("supply-level-unknown"),
+    }
+}
+
+/// The bar: how much is left, and where the printer says to take notice.
+///
+/// The mark sits on a layer of its own rather than inside the bar, so that the bar
+/// stays one unbroken rounded shape and the level it shows is not eaten into.
+fn progress_track(supply: &SupplyLevel, colors: &[Color]) -> Element<'static, Message> {
+    let track = container(supply_fill(supply.level_percent, colors))
+        .width(Length::Fill)
+        .height(Length::Fixed(SUPPLY_TRACK_HEIGHT))
+        .class(widgets::fill_container(SUPPLY_TRACK, RADIUS_SUPPLY_BAR));
+
+    let Some(warning) = supply.warning else {
+        return track.into();
+    };
+
+    cosmic::iced_widget::stack![
+        container(track)
+            .width(Length::Fill)
+            .height(Length::Fixed(SUPPLY_BAR_HEIGHT))
+            .align_y(Alignment::Center),
+        warning_mark(warning, supply.level_percent),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fixed(SUPPLY_BAR_HEIGHT))
+    .into()
+}
+
+/// How much of the track is filled, in the supply's own colours.
+fn supply_fill(level: Option<u8>, colors: &[Color]) -> Element<'static, Message> {
+    let mut bar = row::with_capacity(2).height(Length::Fixed(SUPPLY_TRACK_HEIGHT));
+    // A level nothing reported fills nothing; the text beside it says as much.
+    let filled = level.unwrap_or(0).min(100);
+    let empty = 100_u8.saturating_sub(filled);
+
+    if filled > 0 {
         bar = bar.push(
-            container(horizontal_space())
-                .width(Length::FillPortion(fill_portion))
-                .height(Length::Fixed(12.0))
-                .class(widgets::fill_container(fill, 40.0)),
+            container(supply_bands(colors))
+                .width(Length::FillPortion(u16::from(filled)))
+                .height(Length::Fixed(SUPPLY_TRACK_HEIGHT)),
         );
     }
 
-    if empty_portion > 0 {
-        bar = bar.push(horizontal_space().width(Length::FillPortion(empty_portion)));
+    // A portion of zero is laid out at full width and only then ignored, so an empty
+    // side is left out rather than asked for.
+    if empty > 0 {
+        bar = bar.push(horizontal_space().width(Length::FillPortion(u16::from(empty))));
     }
 
-    container(bar)
-        .width(Length::Fixed(224.0))
-        .height(Length::Fixed(12.0))
-        .class(widgets::fill_container(SUPPLY_TRACK, 40.0))
-        .into()
+    bar.into()
 }
 
-fn supply_label(supply: Option<&SupplyLevel>, fallback: &str) -> String {
-    let label = supply
-        .map(|supply| supply.name.clone())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| fallback.into());
+/// The filled part, drawn as one band per colour the supply holds.
+fn supply_bands(colors: &[Color]) -> Element<'static, Message> {
+    let Some((first, rest)) = colors.split_first() else {
+        return band(SUPPLY_NEUTRAL, RADIUS_SUPPLY_BAR.into()).into();
+    };
 
-    if label == "Tricolor" {
-        "Tricolor cartridge".into()
+    if rest.is_empty() {
+        return band(*first, RADIUS_SUPPLY_BAR.into()).into();
+    }
+
+    // Only the ends of the bar are rounded, so several bands still read as one bar.
+    let squared = Radius::default();
+    let mut bands = row::with_capacity(colors.len()).height(Length::Fixed(SUPPLY_TRACK_HEIGHT));
+    bands = bands.push(
+        band(
+            *first,
+            squared
+                .top_left(RADIUS_SUPPLY_BAR)
+                .bottom_left(RADIUS_SUPPLY_BAR),
+        )
+        .width(Length::FillPortion(1)),
+    );
+
+    for (index, color) in rest.iter().enumerate() {
+        let last = index + 1 == rest.len();
+        let radius = if last {
+            squared
+                .top_right(RADIUS_SUPPLY_BAR)
+                .bottom_right(RADIUS_SUPPLY_BAR)
+        } else {
+            squared
+        };
+
+        bands = bands.push(band(*color, radius).width(Length::FillPortion(1)));
+    }
+
+    bands.into()
+}
+
+fn band(color: Color, radius: Radius) -> container::Container<'static, Message, cosmic::Theme> {
+    let style = if needs_outline(color) {
+        widgets::bordered_fill_container(color, DIVIDER, radius)
     } else {
-        label
+        widgets::fill_container(color, radius)
+    };
+
+    container(horizontal_space())
+        .width(Length::Fill)
+        .height(Length::Fixed(SUPPLY_TRACK_HEIGHT))
+        .class(style)
+}
+
+/// The mark showing where the printer says a supply needs attention.
+///
+/// It stands taller than the bar so that it can be seen over whatever colour is under
+/// it, and turns to the warning colour once the level has reached it.
+fn warning_mark(warning: SupplyWarning, level: Option<u8>) -> Element<'static, Message> {
+    let reached = level.is_some_and(|level| warning.is_reached_by(level));
+    let before = warning.level_percent.min(100);
+    let after = 100_u8.saturating_sub(before);
+    let mut marks = row::with_capacity(3)
+        .width(Length::Fill)
+        .height(Length::Fixed(SUPPLY_BAR_HEIGHT))
+        .align_y(Alignment::Center);
+
+    if before > 0 {
+        marks = marks.push(horizontal_space().width(Length::FillPortion(u16::from(before))));
+    }
+
+    marks = marks.push(
+        container(horizontal_space())
+            .width(Length::Fixed(SUPPLY_MARK_WIDTH))
+            .height(Length::Fixed(SUPPLY_MARK_HEIGHT))
+            .class(widgets::fill_container(
+                if reached { STATUS_STOPPED } else { TITLE_TEXT },
+                1.0,
+            )),
+    );
+
+    if after > 0 {
+        marks = marks.push(horizontal_space().width(Length::FillPortion(u16::from(after))));
+    }
+
+    marks.into()
+}
+
+/// The colours to draw a supply in, each lifted until it can be seen on the card.
+fn bar_colors(supply: &SupplyLevel) -> Vec<Color> {
+    supply
+        .colors
+        .iter()
+        .map(|color| visible_on_card(supply_color(*color)))
+        .collect()
+}
+
+fn supply_color(color: SupplyRgb) -> Color {
+    Color::from_rgba8(color.red, color.green, color.blue, 1.0)
+}
+
+/// Lifts a colour until its strongest channel clears what the card behind it needs,
+/// leaving its hue alone.
+///
+/// Black has no hue to leave alone, so it becomes the neutral that floor names — which
+/// is why a black cartridge draws as grey rather than as a bar that cannot be seen.
+fn visible_on_card(color: Color) -> Color {
+    let peak = color.r.max(color.g).max(color.b);
+    if peak >= SUPPLY_MIN_CHANNEL {
+        return color;
+    }
+    if peak <= f32::EPSILON {
+        return SUPPLY_NEUTRAL;
+    }
+
+    let scale = SUPPLY_MIN_CHANNEL / peak;
+
+    Color {
+        r: (color.r * scale).min(1.0),
+        g: (color.g * scale).min(1.0),
+        b: (color.b * scale).min(1.0),
+        ..color
     }
 }
 
-fn tricolor_indicator() -> Element<'static, Message> {
-    row::with_capacity(3)
-        .width(Length::Fixed(32.0))
-        .height(Length::Fixed(8.0))
-        .spacing(4)
-        .push(color_dot(Color::from_rgb(0.0, 1.0, 1.0)))
-        .push(color_dot(Color::from_rgb(1.0, 0.0, 1.0)))
-        .push(color_dot(Color::from_rgb(1.0, 1.0, 0.0)))
-        .into()
+/// Returns whether a colour needs an edge drawn to be told from the track behind it.
+///
+/// Brightening cannot separate two greys, so the one case it does not answer is a
+/// supply whose colour is close to the track's own.
+fn needs_outline(color: Color) -> bool {
+    let peak = color.r.max(color.g).max(color.b);
+    let track = SUPPLY_TRACK.r.max(SUPPLY_TRACK.g).max(SUPPLY_TRACK.b);
+
+    (peak - track).abs() < SUPPLY_OUTLINE_TOLERANCE
+}
+
+/// A dot per colour, for a cartridge that holds more than one.
+fn color_dots(colors: &[Color]) -> Element<'static, Message> {
+    let mut dots = row::with_capacity(colors.len())
+        .height(Length::Fixed(SUPPLY_DOT_SIZE))
+        .spacing(4);
+
+    for color in colors {
+        dots = dots.push(color_dot(*color));
+    }
+
+    dots.into()
 }
 
 fn color_dot(color: Color) -> Element<'static, Message> {
     container(horizontal_space())
-        .width(Length::Fixed(8.0))
-        .height(Length::Fixed(8.0))
-        .class(widgets::bordered_fill_container(color, DIVIDER, 160.0))
+        .width(Length::Fixed(SUPPLY_DOT_SIZE))
+        .height(Length::Fixed(SUPPLY_DOT_SIZE))
+        .class(widgets::bordered_fill_container(
+            color,
+            DIVIDER,
+            RADIUS_PILL,
+        ))
         .into()
-}
-
-fn find_supply<'a>(supplies: &'a [SupplyLevel], needle: &str) -> Option<&'a SupplyLevel> {
-    supplies
-        .iter()
-        .find(|supply| supply.name.to_lowercase().contains(needle))
 }
 
 fn selected_label(labels: &[String], selected: usize) -> String {
     labels.get(selected).cloned().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channels(color: Color) -> [u8; 3] {
+        [
+            (color.r * 255.0).round() as u8,
+            (color.g * 255.0).round() as u8,
+            (color.b * 255.0).round() as u8,
+        ]
+    }
+
+    /// Black is a bar that cannot be seen on the card, so it is lifted to the grey the
+    /// design draws it as. A colour bright enough already is left alone.
+    #[test]
+    fn a_supply_too_dark_to_see_is_lifted() {
+        assert_eq!(channels(visible_on_card(Color::BLACK)), [0x9A, 0x9A, 0x9A]);
+
+        for bright in [
+            Color::from_rgba8(0x00, 0xFF, 0xFF, 1.0),
+            Color::from_rgba8(0xFF, 0x00, 0xFF, 1.0),
+            Color::from_rgba8(0xFF, 0xFF, 0x00, 1.0),
+        ] {
+            assert_eq!(channels(visible_on_card(bright)), channels(bright));
+        }
+    }
+
+    /// Lifting a colour keeps its hue: a dark blue becomes a brighter blue, not grey.
+    #[test]
+    fn lifting_a_colour_keeps_its_hue() {
+        let lifted = visible_on_card(Color::from_rgba8(0x00, 0x00, 0x80, 1.0));
+
+        assert_eq!(channels(lifted), [0x00, 0x00, 0x9A]);
+    }
+
+    /// Brightening cannot separate two greys, so a supply the colour of the track gets
+    /// an edge instead.
+    #[test]
+    fn a_supply_the_colour_of_the_track_is_outlined() {
+        assert!(needs_outline(SUPPLY_TRACK));
+        assert!(!needs_outline(SUPPLY_NEUTRAL));
+        assert!(!needs_outline(Color::from_rgba8(0x00, 0xFF, 0xFF, 1.0)));
+    }
+
+    #[test]
+    fn a_card_is_as_tall_as_the_rows_it_holds() {
+        assert_eq!(supplies_card_height(1), 57.0);
+        assert_eq!(supplies_card_height(2), 110.0);
+        assert_eq!(supplies_card_height(3), 163.0);
+        // No supplies draws no card, but the height must not go negative if asked.
+        assert_eq!(supplies_card_height(0), 57.0);
+    }
+
+    #[test]
+    fn supplies_fill_rows_two_at_a_time() {
+        assert_eq!(
+            (1..=5).map(supply_rows).collect::<Vec<_>>(),
+            [1, 1, 2, 2, 3]
+        );
+    }
+
+    /// Which supplies share a row is decided before layout, so it cannot change with
+    /// the width of the pane, and the order is the one the printer reported.
+    #[test]
+    fn rows_keep_the_order_the_printer_reported() {
+        let supplies = [0, 1, 2, 3, 4];
+        let rows = supplies
+            .chunks(SUPPLY_COLUMNS)
+            .map(<[i32]>::to_vec)
+            .collect::<Vec<_>>();
+
+        assert_eq!(rows, [vec![0, 1], vec![2, 3], vec![4]]);
+        assert_eq!(rows.concat(), supplies);
+    }
+
+    #[test]
+    fn a_full_supply_is_written_without_a_decimal() {
+        assert_eq!(percentage_label(Some(100)), "100%");
+        assert_eq!(percentage_label(Some(92)), "92.0%");
+        assert_eq!(percentage_label(Some(0)), "0.0%");
+    }
 }

@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use cosmic_settings_printers_client::{self as printers_client};
+use cosmic_settings_printers_core::SupplyLevel;
 
 pub async fn open_printer_web_page(web_page: String) -> Result<(), String> {
     let status = tokio::process::Command::new("xdg-open")
@@ -55,6 +56,15 @@ pub async fn set_printer_option_default(
 
     client
         .set_printer_option_default(&printer_id, &option, &[value])
+        .await
+        .map_err(display_error)
+}
+
+pub async fn printer_supplies(printer_id: String) -> Result<Vec<SupplyLevel>, String> {
+    let mut client = printers_client::connect().await.map_err(display_error)?;
+
+    client
+        .printer_supplies(&printer_id)
         .await
         .map_err(display_error)
 }

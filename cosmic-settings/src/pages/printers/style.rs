@@ -89,11 +89,16 @@ pub const SUPPLY_TRACK: Color = Color::from_rgb(
     0x63 as f32 / 255.0,
     0x63 as f32 / 255.0,
 );
-pub const BLACK_SUPPLY: Color = Color::from_rgb(
-    0x80 as f32 / 255.0,
-    0x80 as f32 / 255.0,
-    0x80 as f32 / 255.0,
-);
+/// How bright a supply's strongest channel has to be to be seen on the card.
+///
+/// A black cartridge reports itself as black, which on a dark card is no bar at all,
+/// so a colour below this is lifted to reach it.
+pub const SUPPLY_MIN_CHANNEL: f32 = 0x9A as f32 / 255.0;
+/// What a supply is drawn in when it has no colour of its own to lift.
+pub const SUPPLY_NEUTRAL: Color =
+    Color::from_rgb(SUPPLY_MIN_CHANNEL, SUPPLY_MIN_CHANNEL, SUPPLY_MIN_CHANNEL);
+/// How close to the track a colour may be before it needs an edge to be told apart.
+pub const SUPPLY_OUTLINE_TOLERANCE: f32 = 0.15;
 pub const REMOVE_BG: Color = Color::from_rgb(
     0xFF as f32 / 255.0,
     0xA0 as f32 / 255.0,
@@ -101,8 +106,24 @@ pub const REMOVE_BG: Color = Color::from_rgb(
 );
 pub const REMOVE_TEXT: Color = Color::BLACK;
 
+// Supply card dimensions, from the design.
+/// A label of 21 and a bar row of 20, stacked with no gap.
+pub const SUPPLY_GRAPH_HEIGHT: f32 = 41.0;
+pub const SUPPLY_LABEL_HEIGHT: f32 = 21.0;
+pub const SUPPLY_BAR_HEIGHT: f32 = 20.0;
+pub const SUPPLY_TRACK_HEIGHT: f32 = 12.0;
+pub const SUPPLY_CARD_PADDING_Y: f32 = 8.0;
+pub const SUPPLY_COLUMN_SPACING: u16 = 16;
+pub const SUPPLY_ROW_SPACING: u16 = 12;
+pub const SUPPLY_PERCENTAGE_WIDTH: f32 = 48.0;
+pub const SUPPLY_DOT_SIZE: f32 = 8.0;
+/// The mark stands taller than the bar so it reads over whatever is under it.
+pub const SUPPLY_MARK_WIDTH: f32 = 2.0;
+pub const SUPPLY_MARK_HEIGHT: f32 = 16.0;
+
 // Shared dimensions.
 pub const RADIUS_CARD: f32 = 8.0;
+pub const RADIUS_SUPPLY_BAR: f32 = 40.0;
 pub const RADIUS_PILL: f32 = 160.0;
 pub const DIVIDER_HEIGHT: f32 = 1.0;
 pub const ICON_SIZE: u16 = 16;
