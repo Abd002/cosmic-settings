@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use cosmic::Element;
+use cosmic::iced::border::Radius;
 use cosmic::iced::{Alignment, Background, Border, Color, Length, Shadow, Vector};
 use cosmic::iced_core::text::{Ellipsize, EllipsizeHeightLimit, Wrapping};
 use cosmic::widget::{
@@ -24,11 +25,19 @@ pub fn symbolic_icon(name: &'static str, size: u16, color: Color) -> icon::Icon 
         }))
 }
 
-pub fn fill_container(color: Color, radius: f32) -> cosmic::theme::Container<'static> {
+/// A solid fill with rounded corners.
+///
+/// Takes anything a radius can be built from, so a caller drawing one bar out of
+/// several segments can round only the ends of it.
+pub fn fill_container(
+    color: Color,
+    radius: impl Into<Radius>,
+) -> cosmic::theme::Container<'static> {
+    let radius = radius.into();
     cosmic::theme::Container::custom(move |_| cosmic::widget::container::Style {
         background: Some(Background::Color(color)),
         border: Border {
-            radius: radius.into(),
+            radius,
             ..Default::default()
         },
         ..Default::default()
@@ -38,13 +47,14 @@ pub fn fill_container(color: Color, radius: f32) -> cosmic::theme::Container<'st
 pub fn bordered_fill_container(
     background: Color,
     border_color: Color,
-    radius: f32,
+    radius: impl Into<Radius>,
 ) -> cosmic::theme::Container<'static> {
+    let radius = radius.into();
     cosmic::theme::Container::custom(move |_| cosmic::widget::container::Style {
         background: Some(Background::Color(background)),
         border: Border {
             color: border_color,
-            radius: radius.into(),
+            radius,
             width: 1.0,
         },
         ..Default::default()
