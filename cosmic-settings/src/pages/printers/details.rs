@@ -1108,7 +1108,7 @@ fn supply_fill(level: Option<u8>, colors: &[Color]) -> Element<'static, Message>
 
     if filled > 0 {
         bar = bar.push(
-            container(supply_bands(colors))
+            container(band(supply_fill_color(colors)))
                 .width(Length::FillPortion(u16::from(filled)))
                 .height(Length::Fixed(SUPPLY_TRACK_HEIGHT)),
         );
@@ -1123,46 +1123,21 @@ fn supply_fill(level: Option<u8>, colors: &[Color]) -> Element<'static, Message>
     bar.into()
 }
 
-/// The filled part, drawn as one band per colour the supply holds.
-fn supply_bands(colors: &[Color]) -> Element<'static, Message> {
-    let Some((first, rest)) = colors.split_first() else {
-        return band(SUPPLY_NEUTRAL, RADIUS_SUPPLY_BAR.into()).into();
-    };
-
-    if rest.is_empty() {
-        return band(*first, RADIUS_SUPPLY_BAR.into()).into();
+/// The one colour the filled part is drawn in.
+///
+/// A cartridge holding several inks has no single colour to be drawn in, so it takes the accent
+/// and the dots beside the label carry its colours instead. A supply with one colour of its own
+/// wears that colour, and one that reported none falls back to the neutral.
+fn supply_fill_color(colors: &[Color]) -> Color {
+    match colors {
+        [] => SUPPLY_NEUTRAL,
+        [only] => *only,
+        _ => ACCENT,
     }
-
-    // Only the ends of the bar are rounded, so several bands still read as one bar.
-    let squared = Radius::default();
-    let mut bands = row::with_capacity(colors.len()).height(Length::Fixed(SUPPLY_TRACK_HEIGHT));
-    bands = bands.push(
-        band(
-            *first,
-            squared
-                .top_left(RADIUS_SUPPLY_BAR)
-                .bottom_left(RADIUS_SUPPLY_BAR),
-        )
-        .width(Length::FillPortion(1)),
-    );
-
-    for (index, color) in rest.iter().enumerate() {
-        let last = index + 1 == rest.len();
-        let radius = if last {
-            squared
-                .top_right(RADIUS_SUPPLY_BAR)
-                .bottom_right(RADIUS_SUPPLY_BAR)
-        } else {
-            squared
-        };
-
-        bands = bands.push(band(*color, radius).width(Length::FillPortion(1)));
-    }
-
-    bands.into()
 }
 
-fn band(color: Color, radius: Radius) -> container::Container<'static, Message, cosmic::Theme> {
+fn band(color: Color) -> container::Container<'static, Message, cosmic::Theme> {
+    let radius = Radius::from(RADIUS_SUPPLY_BAR);
     let style = if needs_outline(color) {
         widgets::bordered_fill_container(color, DIVIDER, radius)
     } else {
@@ -1359,6 +1334,22 @@ mod tests {
 
         assert_eq!(rows, [vec![0, 1], vec![2, 3], vec![4]]);
         assert_eq!(rows.concat(), supplies);
+    }
+
+    /// A cartridge holding several inks has no one colour to be drawn in, so the bar takes the
+    /// accent and the dots say which colours it holds.
+    #[test]
+    fn a_supply_of_several_colours_is_drawn_in_the_accent() {
+        let cyan = Color::from_rgba8(0x00, 0xFF, 0xFF, 1.0);
+        let magenta = Color::from_rgba8(0xFF, 0x00, 0xFF, 1.0);
+        let yellow = Color::from_rgba8(0xFF, 0xFF, 0x00, 1.0);
+
+        assert_eq!(
+            channels(supply_fill_color(&[cyan, magenta, yellow])),
+            channels(ACCENT)
+        );
+        assert_eq!(channels(supply_fill_color(&[cyan])), channels(cyan));
+        assert_eq!(channels(supply_fill_color(&[])), channels(SUPPLY_NEUTRAL));
     }
 
     #[test]
