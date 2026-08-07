@@ -235,13 +235,12 @@ impl Page {
             .map(|printer| printer.id().to_string());
         self.default_printer_id = printer_id.clone();
 
-        if let Some(printer_id) = printer_id {
-            return set_default_printer_task(printer_id);
+        match printer_id {
+            Some(printer_id) => set_default_printer_task(printer_id),
+            // The first entry is "not set", and choosing it now means something: the user's
+            // default is a line in a file of their own, so it can be taken back out.
+            None => clear_default_printer_task(),
         }
-
-        // TODO: Add an unset-default operation to cosmic-printers.
-        // Reload instead of leaving an unsupported optimistic state.
-        Self::load_printers_task()
     }
 
     fn apply_printers_load(&mut self, load: PrintersLoad) -> Task<crate::Message> {
@@ -893,6 +892,14 @@ fn set_default_printer_task(printer_id: String) -> Task<crate::Message> {
     cosmic::task::future(async move {
         crate::Message::PageMessage(crate::pages::Message::Printers(Message::DefaultPrinterSet(
             backend::set_printer_default(printer_id).await,
+        )))
+    })
+}
+
+fn clear_default_printer_task() -> Task<crate::Message> {
+    cosmic::task::future(async move {
+        crate::Message::PageMessage(crate::pages::Message::Printers(Message::DefaultPrinterSet(
+            backend::clear_printer_default().await,
         )))
     })
 }

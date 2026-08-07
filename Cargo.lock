@@ -1768,7 +1768,7 @@ dependencies = [
 [[package]]
 name = "cosmic-settings-printers-client"
 version = "0.1.0"
-source = "git+https://github.com/Abd002/cosmic-printers.git#48637e2b6b9101e9ec56a4e3e387d19e5f701cf6"
+source = "git+https://github.com/Abd002/cosmic-printers.git#1038532bc5ee6645cc78f38feaa3d8eec7f3a6ae"
 dependencies = [
  "cosmic-settings-printers-core",
  "dirs",
@@ -1780,7 +1780,7 @@ dependencies = [
 [[package]]
 name = "cosmic-settings-printers-core"
 version = "0.1.0"
-source = "git+https://github.com/Abd002/cosmic-printers.git#48637e2b6b9101e9ec56a4e3e387d19e5f701cf6"
+source = "git+https://github.com/Abd002/cosmic-printers.git#1038532bc5ee6645cc78f38feaa3d8eec7f3a6ae"
 dependencies = [
  "nix",
  "serde",

@@ -29,6 +29,12 @@ fn display_error(error: impl Display) -> String {
     error.to_string()
 }
 
+pub async fn clear_printer_default() -> Result<(), String> {
+    let mut client = printers_client::connect().await.map_err(display_error)?;
+
+    client.clear_printer_default().await.map_err(display_error)
+}
+
 pub async fn delete_printer(printer_id: String) -> Result<(), String> {
     let mut client = printers_client::connect().await.map_err(display_error)?;
 

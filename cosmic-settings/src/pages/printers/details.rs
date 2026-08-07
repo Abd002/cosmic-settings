@@ -231,7 +231,12 @@ impl Page {
                 self.is_default = true;
                 Self::set_default_printer_task(printer_id)
             }
-            Message::ToggleDefaultPrinter(_, false) => Task::none(),
+            // Turning it off is a real change now: the user's default lives in a file of
+            // their own, so it can be taken back out again.
+            Message::ToggleDefaultPrinter(_, false) => {
+                self.is_default = false;
+                Self::clear_default_printer_task()
+            }
             Message::RemovePrinter(printer_id) => Self::delete_printer_task(printer_id),
             Message::PrinterDeleted(result) => self.finish_printer_deletion(result),
             Message::PrinterDefaultSet(result) => Self::finish_default_printer_update(result),
@@ -344,6 +349,14 @@ impl Page {
         })
     }
 
+    fn clear_default_printer_task() -> Task<crate::Message> {
+        cosmic::task::future(async move {
+            crate::Message::PageMessage(crate::pages::Message::PrinterDetails(
+                Message::PrinterDefaultSet(backend::clear_printer_default().await),
+            ))
+        })
+    }
+
     fn delete_printer_task(printer_id: String) -> Task<crate::Message> {
         cosmic::task::future(async move {
             crate::Message::PageMessage(crate::pages::Message::PrinterDetails(
@@ -370,24 +383,26 @@ impl Page {
         }
     }
 
-    fn finish_default_printer_update(result: Result<(), String>) -> Task<crate::Message> {
-        match result {
-            Ok(()) => Self::refresh_printers_task(),
-            Err(why) => {
-                tracing::warn!(why, "failed to set default printer");
-                Task::none()
-            }
+    /// Finishes a change that was shown before it was made.
+    ///
+    /// A failure has to put the old value back. The toggles and dropdowns move as soon as
+    /// they are touched, so leaving them alone would show the change as though it had been
+    /// made — silently disagreeing with what a job will actually do. Re-reading is what
+    /// makes the page tell the truth again.
+    fn finish_optimistic_change(result: Result<(), String>, what: &str) -> Task<crate::Message> {
+        if let Err(why) = result {
+            tracing::warn!(why, what, "a printer change was refused");
         }
+
+        Self::refresh_printers_task()
+    }
+
+    fn finish_default_printer_update(result: Result<(), String>) -> Task<crate::Message> {
+        Self::finish_optimistic_change(result, "default printer")
     }
 
     fn finish_location_update(result: Result<(), String>) -> Task<crate::Message> {
-        match result {
-            Ok(()) => Self::refresh_printers_task(),
-            Err(why) => {
-                tracing::warn!(why, "failed to set printer location");
-                Task::none()
-            }
-        }
+        Self::finish_optimistic_change(result, "location")
     }
 
     fn open_location_dialog(&mut self, printer_id: String) {
@@ -463,13 +478,7 @@ impl Page {
     }
 
     fn finish_option_default_update(result: Result<(), String>) -> Task<crate::Message> {
-        match result {
-            Ok(()) => Self::refresh_printers_task(),
-            Err(why) => {
-                tracing::warn!(why, "failed to set printer option default");
-                Task::none()
-            }
-        }
+        Self::finish_optimistic_change(result, "option default")
     }
 
     fn open_printer_queue(&self, printer_id: &str) -> Task<crate::Message> {
@@ -543,7 +552,7 @@ fn details_content<'a>(
         .push(info_card(printer))
         .push(preferences_card(page, printer))
         .push_maybe(supplies_section(&page.supplies))
-        .push(remove_printer_action(printer))
+        .push_maybe(remove_printer_action(printer))
         .into()
 }
 
@@ -652,13 +661,7 @@ fn default_queue_card(printer: &PrinterEntry, is_default: bool) -> Element<'stat
 fn info_card(printer: &PrinterEntry) -> Element<'static, Message> {
     widgets::card(
         column::with_capacity(7)
-            .push(settings_row(
-                fl!("location"),
-                editable_value(
-                    printer.location().unwrap_or_default().to_string(),
-                    printer.id().to_string(),
-                ),
-            ))
+            .push(settings_row(fl!("location"), location_value(printer)))
             .push(widgets::divider())
             .push(value_row(
                 fl!("model"),
@@ -887,7 +890,18 @@ fn supplies_card_height(rows: usize) -> f32 {
         + (rows - 1.0) * f32::from(SUPPLY_ROW_SPACING)
 }
 
-fn remove_printer_action(printer: &PrinterEntry) -> Element<'static, Message> {
+/// The remove button, for a printer that something actually holds.
+///
+/// Withheld otherwise. A destination that is only advertised has no queue to remove, and a
+/// user outside the scheduler's administrative group would be refused with nothing to type
+/// — so offering the button could only ever waste the press.
+fn remove_printer_action(printer: &PrinterEntry) -> Option<Element<'static, Message>> {
+    printer
+        .can_administer()
+        .then(|| remove_printer_button(printer))
+}
+
+fn remove_printer_button(printer: &PrinterEntry) -> Element<'static, Message> {
     container(
         row::with_capacity(2)
             .width(Length::Fill)
@@ -938,6 +952,22 @@ fn settings_row<'a>(
 
 fn value_row(label: String, value: String) -> Element<'static, Message> {
     settings_row(label, right_value(value, 320.0))
+}
+
+/// The location, editable only where the change could actually be sent.
+///
+/// Changing it is `Set-Printer-Attributes` on the printer, so it needs a service holding the
+/// printer and this user in the scheduler's administrative group. Without both, the value is
+/// still worth showing — the printer reported it — but the pencil would only lead to a
+/// refusal.
+fn location_value(printer: &PrinterEntry) -> Element<'static, Message> {
+    let location = printer.location().unwrap_or_default().to_string();
+
+    if printer.can_administer() {
+        editable_value(location, printer.id().to_string())
+    } else {
+        right_value(location, 320.0)
+    }
 }
 
 fn editable_value(value: String, printer_id: String) -> Element<'static, Message> {
